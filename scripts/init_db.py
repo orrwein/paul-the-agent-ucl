@@ -11,7 +11,7 @@ Tables:
 import sqlite3
 import os
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 
 
 def main():

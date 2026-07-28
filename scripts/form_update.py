@@ -23,7 +23,7 @@ import model
 
 W_BLEND = 0.30          # how much one game moves the rating
 CAP_LO, CAP_HI = 0.5, 2.0
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 
 
 def clamp(x):

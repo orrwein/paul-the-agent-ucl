@@ -21,7 +21,7 @@ import sqlite3
 import os
 from math import exp, factorial
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 MAXG = 7
 W_MKT = 0.40  # weight on betting-site correct-score consensus (0=model only)
 

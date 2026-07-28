@@ -27,7 +27,7 @@ import os
 import sqlite3
 import sys
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 
 # Which locked-fixtures table each pairing may live in -> (matchday, label).
 STAGE_TABLES = [

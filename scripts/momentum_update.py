@@ -17,7 +17,7 @@ in team_momentum; the model adds it on top of Elo for the upcoming matchday only
 import os
 import sqlite3
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 MOM_K = 34          # max raw momentum swing (Elo pts)
 CAP = 28
 HOST_ELO = 80

@@ -23,7 +23,7 @@ import os
 import sqlite3
 from math import exp, factorial, log
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 MAXG = 9
 RHO = -0.11               # Dixon-Coles low-score dependence
 DRAW_BOOST = 1.0          # diagonal (draw) inflation, calibrated from results

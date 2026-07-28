@@ -464,6 +464,36 @@ function setupReveal() {
   });
 }
 
+function renderFinalReport(data) {
+  const section = document.getElementById("retro");
+  const host = document.getElementById("finalBanner");
+  if (!section || !host) return;
+  const futures = data.futures || [];
+  const complete = data.summary.pending === 0 && futures.length > 0
+    && futures.every((f) => f.status === "won" || f.status === "lost");
+  section.style.display = complete ? "" : "none";
+  if (!complete) return;
+
+  const icons = { champion: "🏆", golden_boot: "⚽" };
+  host.innerHTML = futures.map((f) => {
+    const won = f.status === "won";
+    const drifted = f.pick !== f.current;
+    return `
+      <div class="pick-banner">
+        <div class="pb-ic">${icons[f.kind] || "◆"}</div>
+        <div class="pb-main">
+          <div class="pb-lbl">${f.label} — Final</div>
+          <div class="pb-name"><span class="flag">${f.current_flag}</span> ${f.current}</div>
+          ${drifted ? `<div class="pb-orig">Locked pre-tournament pick: <span class="flag">${f.flag}</span> <s>${f.pick}</s></div>` : ""}
+          <div class="pb-sub">${drifted
+            ? `The locked pick drifted mid-tournament, and the final result went to <b>${f.current}</b>.`
+            : `The locked pick held from day one — <b>${f.current}</b> all the way to the final result.`}</div>
+        </div>
+        <div class="pb-tag ${won ? "pb-final" : "pb-lost"}">${won ? "Won" : "Lost"}</div>
+      </div>`;
+  }).join("");
+}
+
 async function main() {
   const data = await fetch("data.json?" + Date.now()).then((r) => r.json());
   ALL_PREDS = data.predictions;
@@ -477,6 +507,7 @@ async function main() {
   renderGoldenBoot(data.golden_boot);
   renderRace(data.odds, data.title_race);
   renderMethods();
+  renderFinalReport(data);
   setupReveal();
 
   const when = new Date(data.generated_at).toLocaleString(undefined, {

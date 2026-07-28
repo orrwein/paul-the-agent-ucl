@@ -1,11 +1,21 @@
 # Paul the Agent 🐙
 
-A slick, self-grading dashboard for 2026 FIFA World Cup predictions — the
+A slick, self-grading dashboard for FIFA World Cup predictions — the
 spiritual successor to Paul the Octopus, only this one shows its work. An
 ensemble model (Dixon–Coles + Elo + momentum) locks a scoreline **before**
 kickoff, then grades itself against real results — no hindsight, no edits.
 
 **Live site:** https://nakashon.github.io/paul-the-agent/
+
+**Final record — 2026 FIFA World Cup:** 75.8% outcome accuracy (69/91) and an
+11.0% exact-scoreline rate across every graded match. Both season-long
+futures — Champion (Spain) and Golden Boot (Kylian Mbappé, 10 goals) — were
+locked before the tournament started and held all the way to the final
+whistle. See the live site's "Final Report" section for the full retrospective.
+
+This repo is open source (MIT licensed) and built to be reused: the pipeline
+is generic across tournaments — point it at a new database and it runs the
+same way for the next one.
 
 ## What it shows
 
@@ -28,11 +38,13 @@ kickoff, then grades itself against real results — no hindsight, no edits.
 
 ## How it works
 
-1. Predictions and results live in `data/wc2026.db` (SQLite), maintained by the
-   scripts in `scripts/`.
-2. `scripts/export_site.py` joins predictions against results, classifies each
+1. Predictions and results live in a SQLite database (`data/wc2026.db` for the
+   2026 World Cup), maintained by the scripts in `scripts/`.
+2. `scripts/paths.py` is the single source of truth for which database and
+   tournament name every script uses — see "Starting a new tournament" below.
+3. `scripts/export_site.py` joins predictions against results, classifies each
    pick as exact / correct-outcome / miss, and writes `docs/data.json`.
-3. `docs/` is a static site (no build step) that renders that JSON.
+4. `docs/` is a static site (no build step) that renders that JSON.
 
 ## Update the site after new results
 
@@ -82,3 +94,32 @@ dashboard — they're documented here for reference only.
 | Final | 8 | 15 |
 
 Futures: champion and golden boot worth 12 pts each.
+
+## Starting a new tournament
+
+Every script imports its database path from `scripts/paths.py`, which
+defaults to the 2026 World Cup archive but is fully overridable via
+environment variables — no code edits needed to point this at a new season
+(Euro 2028, WC 2030, ...):
+
+```bash
+export PAUL_DB=data/euro2028.db
+export PAUL_TOURNAMENT="2028 UEFA European Championship"
+
+python3 scripts/init_db.py          # create the fresh database + team list
+python3 scripts/result.py ...       # record results as usual
+python3 scripts/update.py           # sync everything, incl. docs/data.json
+```
+
+The `data/wc2026.db` archive is never touched unless `PAUL_DB` points at it
+(its default), so the completed 2026 record stays intact regardless of what
+else you run. Bracket-shape details specific to a 32-team World Cup (e.g.
+`KNOCKOUT_MD` in `scripts/result.py`, `SF_ORDER` in `scripts/final.py` /
+`scripts/third_place.py`) still assume a World Cup-style draw — a
+differently-shaped bracket (e.g. Euro's Round of 16 start) would need those
+tweaked too.
+
+## License
+
+[MIT](LICENSE) — fork it, run it for your own bracket, or just read the code.
+

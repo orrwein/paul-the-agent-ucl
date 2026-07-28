@@ -11,7 +11,7 @@ import importlib.util
 import os
 import sqlite3
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 SHRINK = 0.45  # 0 = ignore results, 1 = fully trust observed scoring
 DRAW_SHRINK = 0.55  # how far to move predicted draw rate toward observed
 DRAW_BOOST_CAP = 1.60  # MD-cautious nudge to reach the SHRUNK target, still far

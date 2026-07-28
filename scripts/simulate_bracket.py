@@ -25,7 +25,7 @@ import random
 import sqlite3
 import sys
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 spec = importlib.util.spec_from_file_location(
     "model", os.path.join(os.path.dirname(__file__), "model.py"))
 M = importlib.util.module_from_spec(spec)

@@ -13,7 +13,7 @@ import os
 import sqlite3
 import model
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 EXACT_PTS, DIR_PTS = 5, 2
 
 # official Round of 32 bracket: (home/first-named, away)

@@ -11,8 +11,9 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 
+from paths import DB, TOURNAMENT
+
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB = os.path.join(BASE, "data", "wc2026.db")
 OUT = os.path.join(BASE, "docs", "data.json")
 
 # Team -> ISO 3166-1 alpha-2 (for regional-indicator flag emoji). England and

@@ -11,7 +11,7 @@ import os
 import sqlite3
 import model
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 
 MD2_FIXTURES = [
     ("A", "Mexico", "South Korea"), ("A", "Czechia", "South Africa"),

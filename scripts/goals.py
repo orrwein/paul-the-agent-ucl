@@ -30,7 +30,7 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 
 # Kept in sync with export_site.py's GB_SEED so a fresh DB looks the same
 # however it's first touched.

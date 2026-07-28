@@ -17,7 +17,7 @@ import os
 import sqlite3
 from math import exp, factorial
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 MAXG = 8
 BASE_TOTAL = 2.55
 HOSTS = {"Mexico", "Canada", "USA"}

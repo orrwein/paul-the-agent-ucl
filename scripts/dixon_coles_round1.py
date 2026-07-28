@@ -15,7 +15,7 @@ import os
 import sqlite3
 from math import exp, factorial
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 MAXG = 8
 MU = 1.35          # avg goals per team per game (anchor)
 RHO = -0.13        # Dixon-Coles low-score dependence

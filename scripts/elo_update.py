@@ -15,7 +15,7 @@ elo_base is backed up once; re-runnable from match_results each matchday.
 import os
 import sqlite3
 
-DB = os.path.join(os.path.dirname(__file__), "..", "data", "wc2026.db")
+from paths import DB
 K0 = 55                       # World Cup K-factor
 HOST_ELO = 80
 HOSTS = {"Mexico", "Canada", "USA"}
