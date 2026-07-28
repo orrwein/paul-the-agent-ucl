@@ -78,6 +78,7 @@ dashboard — they're documented here for reference only.
 | Round of 16 | 2 | 5 |
 | Quarter-final | 4 | 8 |
 | Semi-final | 5 | 10 |
+| Third-place | 5 | 10 |
 | Final | 8 | 15 |
 
 Futures: champion and golden boot worth 12 pts each.
