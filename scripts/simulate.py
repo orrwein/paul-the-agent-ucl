@@ -66,6 +66,23 @@ N_SIMS = int(os.environ.get("PAUL_SIMS", 20000))
 # anything about football justifies.
 ELO_SIGMA = float(os.environ.get("PAUL_ELO_SIGMA", 40))
 
+# Regression to the mean, which is a separate problem from the noise above and
+# is not fixed by it. Projecting a whole season forward from one day's ratings
+# over-rewards the strongest clubs: measured in scripts/validate_sim.py against
+# 2024/25 and 2025/26, actual league-phase points regressed on the points this
+# simulator expects give a slope of 0.87 and 0.92. Below 1 means the favourites
+# are being spread too far from the field.
+#
+# The reason it does not contradict the per-match fit: model.predict is scored
+# against the rating a club held THAT WEEK, so it follows a club sliding down
+# the table. The simulator freezes September's rating for nine months and so
+# never sees the slide. Shrinking each club's deviation from the field mean is
+# the direct correction, and 0.90 is what the two seasons measured.
+#
+# This belongs to season projection only. For one upcoming match today's rating
+# is the best estimate available, so model.predict is deliberately untouched.
+ELO_SHRINK = float(os.environ.get("PAUL_ELO_SHRINK", 0.90))
+
 # Perturbations are bucketed before they hit the sampler cache, since building
 # a scoreline matrix per club-pair per continuous draw would be ruinous. 25
 # Elo is about 0.15 goals of supremacy — finer than the effect we are modelling
@@ -77,8 +94,22 @@ SHIFT_CAP = 125
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
+def shrink_elo(data, factor=None):
+    """Pull every rating toward the field mean before projecting a season.
+
+    See ELO_SHRINK. Returns a new data tuple; the caller's is untouched.
+    """
+    factor = ELO_SHRINK if factor is None else factor
+    elo = data[0]
+    if not elo or factor == 1.0:
+        return data
+    mean = sum(elo.values()) / len(elo)
+    shrunk = {t: mean + factor * (r - mean) for t, r in elo.items()}
+    return (shrunk,) + tuple(data[1:])
+
+
 def build():
-    data = M.build_data()
+    data = shrink_elo(M.build_data())
     con = sqlite3.connect(DB)
     teams = [r[0] for r in con.execute("SELECT name FROM teams ORDER BY name")]
     league_fixtures = [
@@ -164,7 +195,7 @@ def pair_shift(shifts, home, away):
 # League phase
 # ---------------------------------------------------------------------------
 def run_league(teams, fixtures, played, data, shifts):
-    """Play all 144 matches, return the 36-club table in finishing order."""
+    """Play all 144 matches. Returns (finishing order, points by club)."""
     pts = defaultdict(int)
     gf = defaultdict(int)
     ga = defaultdict(int)
@@ -188,11 +219,12 @@ def run_league(teams, fixtures, played, data, shifts):
     # UEFA order: points, goal difference, goals for, away goals, wins.
     # random.random() breaks the remaining ties the way the real regulations
     # fall back to drawing of lots.
-    return sorted(
+    order = sorted(
         teams,
         key=lambda t: (pts[t], gf[t] - ga[t], gf[t], away_gf[t], wins[t],
                        random.random()),
         reverse=True)
+    return order, pts
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +332,7 @@ def main():
         # One draw per club per season: whatever a club's true level turns out
         # to be, it is that level in every match it plays this run.
         shifts = draw_shifts(teams)
-        table = run_league(teams, fixtures, played, data, shifts)
+        table, _pts = run_league(teams, fixtures, played, data, shifts)
         run_knockout(table, stats, data, shifts)
     print(f"  {len(_CACHE)} distinct scoreline matrices built")
 

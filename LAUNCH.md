@@ -43,28 +43,42 @@ Ordered by when it can first be done.
 
 ## After the draw, before MD1 (28 Aug → 7 Sep)
 
-- [ ] **⚠ Title odds vs the market — the single most important test.**
-      Run `simulate.py` on the real field and compare against
+- [ ] **⚠ Title odds vs the market.** Run `simulate.py` on the real field and
+      compare against
       [oddschecker](https://www.oddschecker.com/football/champions-league/winner).
-      On the synthetic field the model puts the top-rated club at **~35%**,
-      where a bookmaker would price roughly 15–20%. That gap is unexplained.
-      It is *probably* an artefact of an invented field and schedule — the
-      synthetic top club was the highest-rated in Europe by 63 Elo — but it
-      might be real over-concentration. Diagnosing it against made-up fixtures
-      would have been fitting to my own invention, so it was deliberately left
-      open until real data exists.
 
-      If the gap survives on the real draw, the levers, in order:
-      1. `ELO_TO_GOALS` (0.600) — fitted per-match, but per-match calibration
-         does not guarantee correct compounding over a 13-round tournament.
-      2. `ELO_SIGMA` (40) — raising it widens the title distribution. Measured
-         at ~56 for end-of-season drift; 40 is the season-average figure.
-      3. Knockout randomness — extra time and penalties are currently a coin
-         flip, which is roughly right but adds no upset variance beyond it.
+      What `validate_sim.py` has already settled, against the two completed
+      seasons — this no longer needs the draw:
 
-      Do **not** tune these to match the bookmakers exactly. The market is a
-      sanity check, not ground truth; matching it perfectly would mean we have
-      no independent signal at all.
+      * The **league-phase table is calibrated.** Simulated points-by-position
+        match reality closely; spread ratio 0.95 and 1.01.
+      * The model **did** over-reward rating by club. Actual points regressed
+        on expected gave slopes of 0.87 and 0.92. `ELO_SHRINK = 0.90` corrects
+        it to 0.90 and 0.96.
+      * **When no club runs away with the field, title odds look sane.** For
+        2025/26 (top club +223 over the mean) the model gives its favourite
+        21.8%, about where a market prices one.
+      * **The gap is specific to a standout favourite.** For 2024/25, with Man
+        City +278 clear, it says 35% where the market said roughly 20%. Still
+        unexplained.
+
+      What two seasons **cannot** settle is whether 35% is wrong. Two champions
+      is not a sample; you cannot validate a title probability from it. The
+      market is the only available benchmark, which is why this stays on the
+      list.
+
+      Remaining suspects, in order:
+      1. Two-legged ties may be too deterministic. If a tie between a strong
+         and a good club resolves nearer a coin flip than the model thinks,
+         four rounds of that compounds into exactly this error.
+      2. `ELO_TO_GOALS` (0.600) — fitted per match, and per-match calibration
+         does not guarantee correct compounding across 13 rounds.
+      3. `ELO_SIGMA` (40) — widens the distribution but does **not** fix a
+         systematic tilt; that was what `ELO_SHRINK` was for.
+
+      Do **not** tune to match the bookmakers. The market is a sanity check,
+      not ground truth; matching it exactly would mean we have no independent
+      signal at all.
 - [ ] **`ingest.py --odds` against the real market.** Built and verified
       end-to-end against the qualification market (same code path, 14 EU books,
       de-vigged to `sum(1/o) = 1.0000`), but `soccer_uefa_champs_league` was
