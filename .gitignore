@@ -6,3 +6,5 @@ preview-*.png
 .claude/
 .env
 data/backtest_cache/
+.venv/
+data/soccerdata/

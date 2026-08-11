@@ -1,0 +1,10 @@
+# OPTIONAL. The pipeline is stdlib-only; nothing here is needed to ingest data,
+# lock picks, simulate, or build the site. This covers scripts/xg_update.py
+# alone, which rebuilds team form from expected goals.
+#
+#     pip install -r requirements.txt
+#
+# soccerdata reaches Understat through a TLS-fingerprint shim because the site
+# sits behind bot protection. That is fine for an occasional manual pull and is
+# why xg_update is not wired into the nightly CI job.
+soccerdata>=1.9,<2
