@@ -172,9 +172,12 @@ def main():
     for kind, pts in FUTURES_PTS:
         c.execute("INSERT OR REPLACE INTO futures_pts VALUES (?,?)", (kind, pts))
 
-    # Calibration starts neutral and is fitted from results by calibrate.py.
-    for key in ("goal_cal", "draw_boost"):
-        c.execute("INSERT OR IGNORE INTO model_cal VALUES (?, 1.0)", (key,))
+    # Calibration seeds. goal_cal starts neutral; draw_boost starts at the
+    # value backtest.py fitted over 2024/25 + 2025/26, so a fresh season begins
+    # from measured ground rather than 1.0. calibrate.py re-fits both from
+    # actual results as the season progresses.
+    for key, seed in (("goal_cal", 1.0), ("draw_boost", 1.04)):
+        c.execute("INSERT OR IGNORE INTO model_cal VALUES (?,?)", (key, seed))
 
     con.commit()
     con.close()

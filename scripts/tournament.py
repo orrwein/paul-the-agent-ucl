@@ -141,8 +141,11 @@ TIE_BREAK = ("aggregate", "extra_time", "penalties")
 # Club football has genuine home advantage, which is a simplification over the
 # World Cup build: no host nations, no diaspora "feels-like-home" crowd table.
 # One number, applied to the actual home side, and nothing at the neutral final.
-# Fitted against the completed 2025/26 season in scripts/backtest.py.
-HOME_ELO = float(os.environ.get("PAUL_HOME_ELO", 65))
+#
+# 85 Elo points, fitted in scripts/backtest.py as the advantage that reproduces
+# the observed home share of decisive results across 2024/25 and 2025/26. The
+# initial 65 was a guess and was 24% low.
+HOME_ELO = float(os.environ.get("PAUL_HOME_ELO", 85))
 
 
 def venue_elo(round_id):

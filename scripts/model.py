@@ -32,15 +32,24 @@ from paths import DB
 import tournament as T
 
 MAXG = 9
-RHO = -0.11               # Dixon-Coles low-score dependence
+# Fitted by scripts/backtest.py against the 378 matches of the 2024/25 and
+# 2025/26 Champions League, using each club's ClubElo rating as it stood the
+# day before kickoff. Cross-validated across the two seasons. The upstream
+# World Cup values are noted for comparison — every one of them was wrong for
+# club football, several by a lot.
+RHO = 0.24                # Dixon-Coles low-score dependence (WC build: -0.11)
 DRAW_BOOST = 1.0          # diagonal (draw) inflation, calibrated from results
-# NOTE: the four constants below were fitted to international football by the
-# upstream World Cup build. Club football scores higher and ClubElo's ratings
-# have a different spread, so scripts/backtest.py re-fits them against the
-# completed 2025/26 season. Until that runs, treat these as placeholders.
-BASE_TOTAL = 2.65         # avg goals/game anchor for Elo component
-ELO_TO_GOALS = 0.34       # goals of supremacy per 100 Elo
-MU = 1.33                 # avg goals per team for form component
+BASE_TOTAL = 3.42         # avg goals/game anchor for Elo component (was 2.65)
+ELO_TO_GOALS = 0.604      # goals of supremacy per 100 Elo (was 0.34)
+MU = BASE_TOTAL / 2       # avg goals per team for form component (was 1.33)
+
+# On the sign of RHO: the textbook Dixon-Coles value is negative, because
+# domestic leagues show an excess of 0-0 and 1-1 draws over independent
+# Poisson. This competition does the opposite. The observed draw rate across
+# both seasons is 14-17% against roughly 25% in a typical league, on 3.42
+# goals a game — a 36-club field where everyone qualified produces FEWER
+# low-score draws than Poisson expects. The positive fit is the model
+# reflecting that, not an artefact.
 # ensemble weights. Market odds aggregate everything the public knows, so when
 # present they dominate match DIRECTION; Elo/form/intel mainly shape the exact
 # SCORELINE (where our competition edge actually lives).
@@ -153,10 +162,16 @@ def leg_tilt(lh, la, deficit):
 
 
 # ---- signal 1: Elo ----
-def elo_lambdas(elo, home, away, round_id="md1"):
+def elo_lambdas(elo, home, away, round_id="md1", elo_shift=0.0):
+    """`elo_shift` nudges the home side's edge, in Elo points.
+
+    Used by the simulator to represent uncertainty in the ratings themselves.
+    Only the difference between two clubs ever matters here, so one scalar
+    covers perturbing either side.
+    """
     eh = elo[home] + venue_boost(True, round_id) + ADJ.get(home, 0.0) + MOM.get(home, 0.0)
     ea = elo[away] + venue_boost(False, round_id) + ADJ.get(away, 0.0) + MOM.get(away, 0.0)
-    sup = (eh - ea) / 100 * ELO_TO_GOALS
+    sup = (eh - ea + elo_shift) / 100 * ELO_TO_GOALS
     return BASE_TOTAL / 2 + sup / 2, BASE_TOTAL / 2 - sup / 2
 
 
@@ -217,9 +232,10 @@ def matrix(lh, la):
     return [[v / s for v in r] for r in m]
 
 
-def predict(home, away, data, exact_pts=3, dir_pts=1, round_id="md1", deficit=0):
+def predict(home, away, data, exact_pts=3, dir_pts=1, round_id="md1", deficit=0,
+            elo_shift=0.0):
     elo, form, conf, cw, att_mean, dfn_mean, cal, market = data
-    le_h, le_a = elo_lambdas(elo, home, away, round_id)
+    le_h, le_a = elo_lambdas(elo, home, away, round_id, elo_shift)
     lf_h, lf_a = form_lambdas(form, conf, cw, att_mean, dfn_mean, home, away, round_id)
     mk = market.get((home, away))
     w = W_MKT if mk else W_NO_MKT

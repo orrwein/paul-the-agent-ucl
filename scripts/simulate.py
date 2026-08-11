@@ -32,6 +32,8 @@ import os
 import random
 import sqlite3
 import sys
+from array import array
+from bisect import bisect_left
 from collections import defaultdict
 
 from paths import DB
@@ -42,7 +44,34 @@ spec = importlib.util.spec_from_file_location(
 M = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(M)
 
+MAXG = M.MAXG
 N_SIMS = int(os.environ.get("PAUL_SIMS", 20000))
+
+# ---------------------------------------------------------------------------
+# Strength uncertainty
+# ---------------------------------------------------------------------------
+# A rating is an estimate, not a fact, and a club's real strength wanders over
+# nine months — signings, injuries, a manager change, a collapse in form.
+# Measured across the cached ClubElo snapshots, a club above 1500 drifts with
+# a standard deviation of ~56 Elo from September to May, and that figure was
+# almost identical in 2024/25 (56.8) and 2025/26 (55.4).
+#
+# We want the uncertainty in a club's AVERAGE strength across the season, not
+# in its endpoint. For a random walk the time-average varies about 1/sqrt(3) as
+# much as the endpoint, giving ~32; we round up to 40 to cover the fact that
+# the current rating is itself measured with error.
+#
+# Without this the only randomness in a season is scoreline noise, and the
+# simulation reports far more confidence about the eventual winner than
+# anything about football justifies.
+ELO_SIGMA = float(os.environ.get("PAUL_ELO_SIGMA", 40))
+
+# Perturbations are bucketed before they hit the sampler cache, since building
+# a scoreline matrix per club-pair per continuous draw would be ruinous. 25
+# Elo is about 0.15 goals of supremacy — finer than the effect we are modelling
+# needs to resolve.
+SHIFT_BUCKET = 25
+SHIFT_CAP = 125
 
 
 # ---------------------------------------------------------------------------
@@ -70,57 +99,71 @@ def build():
 
 
 def make_sampler(matrix):
-    flat, cum = [], 0.0
+    """A scoreline as a cumulative distribution, stored compactly.
+
+    There are tens of thousands of these live at once — one per club pairing
+    per aggregate state per strength draw — so the representation matters. A
+    list of (cum, i, j) tuples costs ~7.9 KB each and ran to 800 MB at the
+    default simulation count. Two typed arrays cost about a tenth of that:
+    cumulative probabilities as doubles, and the scoreline packed into one
+    byte, since neither side scores more than nine.
+    """
+    cum = array("d", bytes(len(matrix) * len(matrix[0]) * 8))
+    codes = array("B", bytes(len(cum)))
+    running, k = 0.0, 0
     for i, row in enumerate(matrix):
         for j, p in enumerate(row):
-            cum += p
-            flat.append((cum, i, j))
-    return flat
+            running += p
+            cum[k] = running
+            codes[k] = i * MAXG + j
+            k += 1
+    return cum, codes
 
 
-def sample(flat):
-    r = random.random() * flat[-1][0]
-    lo, hi = 0, len(flat) - 1
-    while lo < hi:                      # bisect: the inner loop of the whole script
-        mid = (lo + hi) // 2
-        if flat[mid][0] < r:
-            lo = mid + 1
-        else:
-            hi = mid
-    return flat[lo][1], flat[lo][2]
+def sample(sampler):
+    cum, codes = sampler
+    r = random.random() * cum[-1]
+    lo = bisect_left(cum, r)
+    if lo >= len(cum):
+        lo = len(cum) - 1
+    code = codes[lo]
+    return code // MAXG, code % MAXG
 
 
-def precompute(data, teams, round_id):
-    """A sampler for every ordered pair, at one round's venue setting."""
-    out = {}
-    for h in teams:
-        for a in teams:
-            if h == a:
-                continue
-            r = M.predict(h, a, data, round_id=round_id)
-            out[(h, a)] = make_sampler(M.matrix(r["lh"], r["la"]))
-    return out
+# Samplers keyed by (pairing, round, aggregate state, strength shift). Second
+# legs vary by the aggregate carried in; every match varies by the strength
+# perturbation drawn for that simulation. Building all the combinations up
+# front would be enormous and mostly wasted, so they are made on demand.
+_CACHE = {}
 
 
-# Second legs need a sampler per (pairing, aggregate state), since a side
-# chasing a two-goal deficit plays a different match from one protecting a
-# lead. That is up to seven variants per pairing, so they are built on demand
-# and cached rather than precomputed — most never come up.
-_LEG2 = {}
+def sampler_for(data, home, away, round_id, deficit=0, shift=0):
+    key = (home, away, round_id, deficit, shift)
+    hit = _CACHE.get(key)
+    if hit is None:
+        r = M.predict(home, away, data, round_id=round_id, deficit=deficit,
+                      elo_shift=shift)
+        hit = _CACHE[key] = make_sampler(M.matrix(r["lh"], r["la"]))
+    return hit
 
 
-def leg2_sampler(data, home, away, round_id, deficit):
-    key = (home, away, round_id, deficit)
-    if key not in _LEG2:
-        r = M.predict(home, away, data, round_id=round_id, deficit=deficit)
-        _LEG2[key] = make_sampler(M.matrix(r["lh"], r["la"]))
-    return _LEG2[key]
+def draw_shifts(teams):
+    """One strength perturbation per club, in bucketed Elo points."""
+    return {t: max(-SHIFT_CAP, min(SHIFT_CAP,
+                   round(random.gauss(0, ELO_SIGMA) / SHIFT_BUCKET) * SHIFT_BUCKET))
+            for t in teams}
+
+
+def pair_shift(shifts, home, away):
+    """Only the difference between two clubs affects a match."""
+    d = shifts[home] - shifts[away]
+    return max(-SHIFT_CAP, min(SHIFT_CAP, d))
 
 
 # ---------------------------------------------------------------------------
 # League phase
 # ---------------------------------------------------------------------------
-def run_league(teams, fixtures, played, samplers):
+def run_league(teams, fixtures, played, data, shifts):
     """Play all 144 matches, return the 36-club table in finishing order."""
     pts = defaultdict(int)
     gf = defaultdict(int)
@@ -130,7 +173,8 @@ def run_league(teams, fixtures, played, samplers):
 
     for rid, h, a in fixtures:
         actual = played.get((rid, h, a))
-        hg, ag = actual if actual else sample(samplers[(h, a)])
+        hg, ag = actual if actual else sample(
+            sampler_for(data, h, a, "md1", 0, pair_shift(shifts, h, a)))
         gf[h] += hg; ga[h] += ag
         gf[a] += ag; ga[a] += hg
         away_gf[a] += ag
@@ -154,16 +198,17 @@ def run_league(teams, fixtures, played, samplers):
 # ---------------------------------------------------------------------------
 # Knockout phase
 # ---------------------------------------------------------------------------
-def play_tie(seed, other, samplers_by_round, round_id, data):
+def play_tie(seed, other, round_id, data, shifts):
     """Two legs, aggregate, then extra time and penalties. `seed` hosts leg 2."""
-    s = samplers_by_round[round_id]
+    fwd = pair_shift(shifts, seed, other)
+    rev = pair_shift(shifts, other, seed)
     # leg 1 at the lower-ranked club
-    g1_h, g1_a = sample(s[(other, seed)])
+    g1_h, g1_a = sample(sampler_for(data, other, seed, round_id, 0, rev))
     # leg 2 at the seed, played with the aggregate in hand. From the seed's
     # point of view (tonight's home side) the lead carried in is what it
     # scored away minus what it conceded there.
     deficit = g1_a - g1_h
-    g2_h, g2_a = sample(leg2_sampler(data, seed, other, round_id, deficit))
+    g2_h, g2_a = sample(sampler_for(data, seed, other, round_id, deficit, fwd))
     agg_seed = g1_a + g2_h
     agg_other = g1_h + g2_a
     if agg_seed != agg_other:
@@ -171,22 +216,21 @@ def play_tie(seed, other, samplers_by_round, round_id, data):
     # Level after 180'. Extra time is another half-match; if that settles
     # nothing, a shootout is close enough to a coin flip that pretending
     # otherwise would be false precision.
-    et_h, et_a = sample(s[(seed, other)])
+    et_h, et_a = sample(sampler_for(data, seed, other, round_id, 0, fwd))
     if et_h != et_a:
         return seed if et_h > et_a else other
     return seed if random.random() < 0.5 else other
 
 
-def single_match(a, b, samplers_by_round, round_id):
+def single_match(a, b, round_id, data, shifts):
     """The final: one match at a neutral venue, ET and pens if level."""
-    s = samplers_by_round[round_id]
-    ha, hb = sample(s[(a, b)])
+    ha, hb = sample(sampler_for(data, a, b, round_id, 0, pair_shift(shifts, a, b)))
     if ha != hb:
         return a if ha > hb else b
     return a if random.random() < 0.5 else b
 
 
-def run_knockout(table, samplers_by_round, stats, data):
+def run_knockout(table, stats, data, shifts):
     """table is the finishing order, index 0 = 1st. Returns the champion."""
     rank = {t: i + 1 for i, t in enumerate(table)}
     by_rank = {i + 1: t for i, t in enumerate(table)}
@@ -204,7 +248,7 @@ def run_knockout(table, samplers_by_round, stats, data):
         unseeded = [by_rank[u_lo], by_rank[u_hi]]
         random.shuffle(unseeded)
         po_winners[band] = [
-            play_tie(seeds[i], unseeded[i], samplers_by_round, "ko_po", data)
+            play_tie(seeds[i], unseeded[i], "ko_po", data, shifts)
             for i in range(2)]
 
     # --- round of 16: band A is 1/2 v the winners out of band IV, and so on.
@@ -214,7 +258,7 @@ def run_knockout(table, samplers_by_round, stats, data):
         challengers = po_winners[feeder][:]
         random.shuffle(challengers)
         r16_winners[band] = [
-            play_tie(seeds[i], challengers[i], samplers_by_round, "r16", data)
+            play_tie(seeds[i], challengers[i], "r16", data, shifts)
             for i in range(2)]
 
     # --- quarters: A v D and B v C, seeded side (better league finish) hosts leg 2
@@ -223,7 +267,7 @@ def run_knockout(table, samplers_by_round, stats, data):
         pairs = list(zip(r16_winners[left], r16_winners[right]))
         for x, y in pairs:
             seed, other = (x, y) if rank[x] < rank[y] else (y, x)
-            sf_teams.append(play_tie(seed, other, samplers_by_round, "qf", data))
+            sf_teams.append(play_tie(seed, other, "qf", data, shifts))
     for t in sf_teams:
         stats[t]["semi"] += 1
 
@@ -232,11 +276,11 @@ def run_knockout(table, samplers_by_round, stats, data):
     for i in range(0, len(sf_teams), 2):
         x, y = sf_teams[i], sf_teams[i + 1]
         seed, other = (x, y) if rank[x] < rank[y] else (y, x)
-        finalists.append(play_tie(seed, other, samplers_by_round, "sf", data))
+        finalists.append(play_tie(seed, other, "sf", data, shifts))
     for t in finalists:
         stats[t]["final"] += 1
 
-    champ = single_match(finalists[0], finalists[1], samplers_by_round, "final")
+    champ = single_match(finalists[0], finalists[1], "final", data, shifts)
     stats[champ]["title"] += 1
     return champ
 
@@ -248,25 +292,17 @@ def main():
     print(f"  {len(teams)} clubs, {len(fixtures)} league fixtures, "
           f"{len(played)} already played")
 
-    # The only thing that varies the scoreline distribution between rounds is
-    # the venue, and the venue only has two settings (home advantage, or the
-    # neutral final). So build one sampler table per setting, not per round —
-    # 1260 ordered pairs each, and building them is the slow part.
-    by_venue = {}
-    samplers_by_round = {}
-    for rid in ("md1", "ko_po", "r16", "qf", "sf", "final"):
-        v = T.venue_elo(rid)
-        if v not in by_venue:
-            by_venue[v] = precompute(data, teams, rid)
-        samplers_by_round[rid] = by_venue[v]
-    league_samplers = samplers_by_round["md1"]
-    print(f"  {len(by_venue)} sampler table(s) built "
-          f"({len(teams) * (len(teams) - 1)} pairings each)")
+    print(f"  strength uncertainty: sigma={ELO_SIGMA:.0f} Elo, "
+          f"bucketed to {SHIFT_BUCKET}")
 
     stats = defaultdict(lambda: defaultdict(int))
     for _ in range(N_SIMS):
-        table = run_league(teams, fixtures, played, league_samplers)
-        run_knockout(table, samplers_by_round, stats, data)
+        # One draw per club per season: whatever a club's true level turns out
+        # to be, it is that level in every match it plays this run.
+        shifts = draw_shifts(teams)
+        table = run_league(teams, fixtures, played, data, shifts)
+        run_knockout(table, stats, data, shifts)
+    print(f"  {len(_CACHE)} distinct scoreline matrices built")
 
     rows = sorted(
         ((stats[t]["title"] / N_SIMS, stats[t]["final"] / N_SIMS,

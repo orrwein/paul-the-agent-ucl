@@ -231,6 +231,7 @@ def fit(rows):
 
     p = dict(base_total=base_total, home_elo=home_elo,
              elo_to_goals=elo_to_goals, rho=-0.11, draw_boost=1.0)
+    ols_slope = elo_to_goals
 
     # RHO and DRAW_BOOST — chosen together to minimise log-loss, since both
     # move the low-score corner of the matrix and fitting either alone just
@@ -255,6 +256,28 @@ def fit(rows):
     _, rho, boost = search([rho + x / 100 for x in range(-4, 5)],
                            [max(0.05, boost + x / 50) for x in range(-4, 5)])
     p["rho"], p["draw_boost"] = round(rho, 3), round(boost, 3)
+
+    # ELO_TO_GOALS, re-fitted by likelihood rather than kept at the OLS slope.
+    #
+    # This matters more than it looks. Least squares on goal difference is
+    # dragged upward by blowouts — a 5-0 pulls the slope hard — and the result
+    # is a model that is right on average and overconfident everywhere. Since
+    # what we actually ship is a probability, fit the thing we are judged on.
+    # Coordinate descent rather than a 3-D grid, which would be ~5x the cost
+    # for no better answer.
+    for _ in range(2):
+        best = (1e9, p["elo_to_goals"])
+        for slope in [x / 100 for x in range(20, 91, 2)]:        # 0.20..0.90
+            ll = log_loss(rows, dict(p, elo_to_goals=slope), neutral)
+            if ll < best[0]:
+                best = (ll, slope)
+        p["elo_to_goals"] = best[1]
+        _, rho, boost = search([p["rho"] + x / 100 for x in range(-5, 6)],
+                               [max(0.05, p["draw_boost"] + x / 50)
+                                for x in range(-5, 6)])
+        p["rho"], p["draw_boost"] = round(rho, 3), round(boost, 3)
+
+    p["ols_slope"] = ols_slope
     if abs(p["rho"]) > 0.38 or p["draw_boost"] < 0.65 or p["draw_boost"] > 1.55:
         print(f"  !! fit still near a boundary (rho={p['rho']}, "
               f"draw_boost={p['draw_boost']}) — widen the search")
@@ -357,7 +380,8 @@ def main():
 Fitted constants — copy into scripts/model.py and tournament.py:
 
     BASE_TOTAL   = {p['base_total']:.2f}      (was 2.65, international football)
-    ELO_TO_GOALS = {p['elo_to_goals']:.3f}     (was 0.34)
+    ELO_TO_GOALS = {p['elo_to_goals']:.3f}     (was 0.34; OLS on goal difference
+                             would have said {p['ols_slope']:.3f} — fitted by likelihood instead)
     RHO          = {p['rho']:.2f}      (was -0.11)
     draw_boost   = {p['draw_boost']:.2f}      (model_cal seed; calibrate.py re-fits in season)
     HOME_ELO     = {p['home_elo']:.0f}        (tournament.py, was a 65 guess)
