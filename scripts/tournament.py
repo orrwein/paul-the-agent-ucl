@@ -161,9 +161,23 @@ def venue_elo(round_id):
 # goals-for/against are mostly racked up in its own league, so a 3-0 in the
 # Eredivisie should not read like a 3-0 in the Premier League.
 #
-# Seeded from UEFA country coefficients and normalised around 1.0. Stored in
-# the confed_weight table (same schema, new contents) so model.py's form
-# adjustment keeps working unchanged.
+# FALLBACK ONLY. These are eyeballed from UEFA country coefficients and are
+# not fitted; scripts/xg_update.py overwrites confed_weight with values it
+# measures, and those should be trusted over anything here.
+#
+# The measured version answers the question properly. Two clubs post 2.0 xG a
+# game, one in the Premier League and one elsewhere — how much of the gap is
+# quality and how much is easier opposition? ClubElo settles it, because Elo is
+# tied to a common scale across leagues by actual European results. Fitting
+# xG against Elo and reading off each league's residual gave a noticeably
+# narrower spread than the guesses below (0.94-1.16 against 1.04-1.18), and
+# reordered them: Serie A and La Liga both came out below 1.0 where these
+# guesses put them near the top.
+#
+# Note also that a league weight is only meaningful for a club whose form is
+# raw domestic xG. Clubs outside Understat's big five have form derived from
+# Elo, which is already cross-league calibrated, so xg_update sets their weight
+# to exactly 1.0 rather than charging them for their league twice.
 #
 # Keys are ClubElo's country codes, which are the ones the Elo feed actually
 # emits — note ROM (not ROU), SLK (not SVK) and BHZ (not BIH).

@@ -51,6 +51,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 from paths import DB, ROOT
+import tournament as T
 import ingest
 
 # soccerdata keeps its league config and HTTP cache in one directory. Pointing
@@ -79,24 +80,28 @@ def load_understat(seasons):
 
 
 def collect(frames):
-    """club -> [xg_for, xg_against, matches], newest matches last."""
+    """[(date, league, home, away, home_xg, away_xg)], oldest first."""
     rows = []
     for df in frames:
-        for _, m in df.iterrows():
+        for idx, m in df.reset_index().iterrows():
             hx, ax = m.get("home_xg"), m.get("away_xg")
             if hx is None or ax is None or hx != hx or ax != ax:
                 continue        # NaN: fixture not played yet
-            rows.append((str(m.get("date")), m["home_team"], m["away_team"],
-                         float(hx), float(ax)))
+            rows.append((str(m.get("date")), m.get("league", ""),
+                         m["home_team"], m["away_team"], float(hx), float(ax)))
     rows.sort()
     return rows
 
 
 def rolling(rows, last):
+    """club -> (xg_for, xg_against, matches, league)."""
     per_team = defaultdict(list)
-    for _date, home, away, hx, ax in rows:
+    league_of = {}
+    for _date, league, home, away, hx, ax in rows:
         per_team[home].append((hx, ax))
         per_team[away].append((ax, hx))
+        league_of[home] = league
+        league_of[away] = league
     out = {}
     for team, games in per_team.items():
         window = games[-last:] if last else games
@@ -104,8 +109,64 @@ def rolling(rows, last):
             continue
         out[team] = (sum(g[0] for g in window) / len(window),
                      sum(g[1] for g in window) / len(window),
-                     len(window))
+                     len(window), league_of.get(team, ""))
     return out
+
+
+# Understat league keys -> the country codes used in confed_weight, which come
+# from ClubElo's vocabulary.
+UNDERSTAT_TO_CODE = {
+    "ENG-Premier League": "ENG", "ESP-La Liga": "ESP", "FRA-Ligue 1": "FRA",
+    "GER-Bundesliga": "GER", "ITA-Serie A": "ITA",
+}
+
+
+def fit_league_weights(stats, elo_snapshot, aliases):
+    """Measure how much each league inflates xG, instead of guessing.
+
+    The question this answers: two clubs post 2.0 xG a game, one in the
+    Premier League and one in a weaker league. How much of that gap is quality
+    and how much is easier opposition?
+
+    ClubElo settles it. Elo is calibrated across leagues by actual results —
+    European ties are precisely what tie the leagues to a common scale — so it
+    is an opposition-independent yardstick for strength. Fit one pooled line
+    from Elo to xG across every club in all five leagues, then ask, per league,
+    whether its clubs sit above or below that line. A league whose clubs
+    consistently out-score what their Elo justifies is inflating xG, and its
+    weight should discount accordingly.
+
+    Returns {code: weight}, normalised so the pooled mean is 1.0.
+    """
+    pts = []
+    for club, (xgf, xga, _n, league) in stats.items():
+        code = UNDERSTAT_TO_CODE.get(league)
+        hit = ingest.match_club(club, elo_snapshot.keys(), aliases)
+        if code and hit:
+            pts.append((code, elo_snapshot[hit][0], xgf, xga))
+    if len(pts) < 40:
+        print(f"  !! only {len(pts)} clubs matched to Elo — keeping the "
+              f"configured league weights")
+        return {}
+
+    af, bf = _fit_line([p[1] for p in pts], [p[2] for p in pts])
+    ad, bd = _fit_line([p[1] for p in pts], [p[3] for p in pts])
+
+    # Per league: how much more xG do its clubs produce, and how much less do
+    # they concede, than their Elo predicts? Attack inflation and defensive
+    # flattery are the same phenomenon seen from both ends, so average them.
+    by_league = defaultdict(list)
+    for code, elo, xgf, xga in pts:
+        pf = af * elo + bf
+        pa = ad * elo + bd
+        if pf <= 0 or pa <= 0:
+            continue
+        by_league[code].append(((xgf / pf) + (pa / xga if xga > 0 else 1.0)) / 2)
+
+    infl = {c: sum(v) / len(v) for c, v in by_league.items() if v}
+    mean = sum(infl.values()) / len(infl)
+    # invert: an inflating league gets discounted
+    return {c: round(mean / v, 3) for c, v in infl.items()}
 
 
 def _fit_line(xs, ys):
@@ -190,7 +251,7 @@ def main():
         if src is None:
             missed.append(team)
             continue
-        xgf, xga, n = stats[src]
+        xgf, xga, n, _league = stats[src]
         hit.append((team, src, xgf, xga, n))
         if args.dry_run:
             continue
@@ -226,9 +287,40 @@ def main():
         print(f"  no Elo to rescale from, keeping existing form: "
               f"{', '.join(missed)}")
 
+    # ---- league normalisation -------------------------------------------
+    # Two different kinds of number now live in team_form, and they must not be
+    # treated alike. A big-five club's figure is raw domestic xG, earned against
+    # that league's opposition, so it needs discounting for how easy that
+    # opposition was. Every other club's figure was derived from its Elo, which
+    # is ALREADY calibrated across leagues — applying a league weight on top
+    # would penalise it twice for the same thing.
+    print("\nLeague normalisation")
+    weights = fit_league_weights(stats, ingest.fetch_clubelo(), aliases)
+    derived_codes = {lg for (lg,) in con.execute(
+        "SELECT DISTINCT league FROM teams WHERE league IS NOT NULL")
+        if lg not in weights}
+    if weights:
+        print("  measured from xG vs Elo (a weight below 1 means the league "
+              "inflates xG):")
+        for code, w in sorted(weights.items(), key=lambda kv: -kv[1]):
+            was = T.LEAGUE_WEIGHT.get(code)
+            print(f"    {code}  {w:5.3f}   (guessed {was})")
+        print(f"  set to 1.000 for {len(derived_codes)} Elo-derived league(s): "
+              f"{', '.join(sorted(c for c in derived_codes if c))}")
+        if not args.dry_run:
+            for code, w in weights.items():
+                con.execute("INSERT OR REPLACE INTO confed_weight VALUES (?,?)",
+                            (code, w))
+            for code in derived_codes:
+                if code:
+                    con.execute(
+                        "INSERT OR REPLACE INTO confed_weight VALUES (?,1.0)",
+                        (code,))
+
     if not args.dry_run:
         con.commit()
-        print("\nteam_form rewritten. next: python3 scripts/update.py --offline")
+        print("\nteam_form and confed_weight rewritten. "
+              "next: python3 scripts/update.py --offline")
     else:
         print("\nDry run — nothing written.")
     con.close()
