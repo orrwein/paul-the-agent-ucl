@@ -23,15 +23,11 @@ spec = importlib.util.spec_from_file_location("model", os.path.join(os.path.dirn
 model = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(model)
 
-# fixtures keyed by id -> (home, away)
-FIX = {1: ("Mexico", "South Africa"), 2: ("South Korea", "Czechia"),
-       3: ("Canada", "Bosnia and Herzegovina"), 4: ("USA", "Paraguay")}
-
 
 def main():
     con = sqlite3.connect(DB)
-    results = [(h, a, hg, ag) for h, a, hg, ag in
-               con.execute("SELECT home, away, hg, ag FROM match_results")]
+    results = [(h, a, hg, ag, rnd) for h, a, hg, ag, rnd in
+               con.execute("SELECT home, away, hg, ag, round FROM match_results")]
     # reset cal to 1.0 so we measure the *base* model, then recompute
     con.execute("UPDATE model_cal SET value=1.0 WHERE key='goal_cal'")
     con.commit()
@@ -40,8 +36,8 @@ def main():
 
     pred_tot = act_tot = 0.0
     n = 0
-    for h, a, hg, ag in results:
-        r = model.predict(h, a, data)
+    for h, a, hg, ag, rnd in results:
+        r = model.predict(h, a, data, round_id=rnd or "md1")
         pred = min(r["lh"] + r["la"], GOAL_CAP)
         act = min(hg + ag, GOAL_CAP)
         pred_tot += pred
@@ -65,15 +61,15 @@ def main():
     # model's average predicted draw rate toward the (shrunk) observed rate.
     con.execute("INSERT OR IGNORE INTO model_cal (key, value) VALUES ('draw_boost', 1.0)")
     con.commit()
-    p_obs = sum(1 for _, _, hg, ag in results if hg == ag) / n
+    p_obs = sum(1 for _, _, hg, ag, _ in results if hg == ag) / n
 
     def avg_draw_prob(boost):
         model.DRAW_BOOST = boost
         data2 = model.build_data()      # build_data() reloads cal; reset boost after
         model.DRAW_BOOST = boost
         tot = 0.0
-        for h, a, _, _ in results:
-            tot += model.predict(h, a, data2)["pd"]
+        for h, a, _, _, rnd in results:
+            tot += model.predict(h, a, data2, round_id=rnd or "md1")["pd"]
         return tot / n
 
     p_model = avg_draw_prob(1.0)

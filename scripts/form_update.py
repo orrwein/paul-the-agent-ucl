@@ -35,15 +35,15 @@ def main():
     base = {t: [gf, ga] for t, gf, ga in
             con.execute("SELECT team, gf, ga FROM team_form_base")}
     results = con.execute(
-        "SELECT home, hg, ag, away FROM match_results").fetchall()
+        "SELECT home, hg, ag, away, round FROM match_results").fetchall()
 
     # build the model with BASE form so 'expected' = pre-tournament estimate
     data = model.build_data()
 
     new = {t: list(v) for t, v in base.items()}
     log = []
-    for home, hg, ag, away in results:
-        r = model.predict(home, away, data)
+    for home, hg, ag, away, rnd in results:
+        r = model.predict(home, away, data, round_id=rnd or "md1")
         exp_h, exp_a = max(r["lh"], 0.3), max(r["la"], 0.3)
         # home team
         ra = clamp(hg / exp_h)

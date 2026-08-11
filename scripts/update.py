@@ -1,45 +1,71 @@
 """Paul the Agent — one-command matchday sync.
 
-Run this after logging new results and goals to refresh everything, in order:
-  1. calibrate.py        — re-tune goal calibration from all stored results
-  2. model.py            — refresh every still-pending locked bet (with calibration)
-  3. qf.py               — lock in any quarter-final ties that just became knowable
-                           (never touches a QF tie once it's already locked)
-  4. sf.py               — lock in any semi-final ties that just became knowable
-                           (never touches an SF tie once it's already locked)
-  5. final.py            — lock in the Final once both semi-finals are decided
-                           (never touches it once it's already locked)
-  6. third_place.py      — lock in the third-place playoff (the two SF losers)
-                           once both semi-finals are decided (never re-touches it)
-  7. simulate_bracket.py — re-run the bracket-aware Monte Carlo for live title odds
-                           (plays the actual set draw, not a bracket-blind reseed)
-  8. export_site.py      — regenerate docs/data.json for the website
+Run this after a matchday to refresh everything, in order:
+
+  1. ingest.py --results --scorers --elo
+                       — pull finished matches, the top-scorer table, and fresh
+                         club ratings from the feeds
+  2. calibrate.py      — re-tune goal calibration and draw boost from all
+                         stored results
+  3. form_update.py    — fold results into team_form, relative to what the
+                         model expected (base form is always preserved)
+  4. momentum_update.py— recompute the short-lived confidence carry-over from
+                         each club's most recent match
+  5. simulate.py       — re-run the Monte Carlo for live title / top-8 odds,
+                         conditioned on results already played
+  6. export_site.py    — regenerate docs/data.json for the website
 
 Usage:
-    # 1) log whatever came in first:
-    python3 scripts/result.py "Home" 2 1 "Away"      # match score (add --pens for shootouts)
-    python3 scripts/goals.py "Player" +1              # golden boot goal tally
-    # 2) then run the sync:
-    python3 scripts/update.py
+    python3 scripts/update.py                  # the whole pipeline
+    python3 scripts/update.py --offline        # skip the network step
+
+Note on Elo: unlike the World Cup build, this pipeline does NOT maintain its
+own Elo ratings. ClubElo already folds every result — European and domestic —
+into its ratings daily, so running our own K-factor update on top of an
+ingested ClubElo number would count the same match twice. The feed is the
+source of truth; scripts/elo_update.py is gone.
+
+Locking picks is deliberately NOT part of this. That is scripts/round.py, run
+by hand before a round kicks off, because a pick going in is the one thing that
+should never happen as a side effect of a refresh.
 """
+import argparse
 import os
 import subprocess
 import sys
 
-HERE = os.path.dirname(__file__)
+HERE = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
 
+PIPELINE = [
+    ("ingest.py", ["--results", "--scorers", "--elo"], True),
+    ("calibrate.py", [], False),
+    ("form_update.py", [], False),
+    ("momentum_update.py", [], False),
+    ("simulate.py", [], False),
+    ("export_site.py", [], False),
+]
 
-def run(script):
-    print(f"\n{'='*60}\n  {script}\n{'='*60}")
-    subprocess.run([PY, os.path.join(HERE, script)], check=True)
+
+def run(script, args):
+    print(f"\n{'='*60}\n  {script} {' '.join(args)}\n{'='*60}")
+    subprocess.run([PY, os.path.join(HERE, script), *args], check=True)
 
 
 def main():
-    for s in ("calibrate.py", "model.py", "qf.py", "sf.py", "final.py", "third_place.py",
-              "simulate_bracket.py", "export_site.py"):
-        run(s)
-    print("\n🐙 Paul the Agent — fully synced: model, title odds, and site data are all up to date.")
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--offline", action="store_true",
+                    help="skip steps that hit the network")
+    args = ap.parse_args()
+
+    for script, script_args, needs_net in PIPELINE:
+        if needs_net and args.offline:
+            print(f"\n-- skipping {script} (--offline)")
+            continue
+        run(script, script_args)
+
+    print("\n🐙 Paul the Agent — synced: results, model, odds and site data "
+          "are all up to date.")
 
 
 if __name__ == "__main__":

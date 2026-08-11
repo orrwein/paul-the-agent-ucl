@@ -18,21 +18,25 @@ import os
 import sqlite3
 
 from paths import DB
+import tournament as T
+
 MOM_K = 34          # max raw momentum swing (Elo pts)
 CAP = 28
-HOST_ELO = 80
-HOSTS = {"Mexico", "Canada", "USA"}
 
 
 def tier_amp(elo):
-    """Average teams ride momentum hardest; elites/minnows much less."""
-    if elo >= 2050:
-        return 0.45
+    """Average teams ride momentum hardest; elites/minnows much less.
+
+    Thresholds are on the ClubElo scale, where the European field runs from
+    roughly 1200 to 2100 and a Champions League entrant is rarely below 1500.
+    """
     if elo >= 1950:
+        return 0.45
+    if elo >= 1850:
         return 0.70
-    if 1680 <= elo < 1950:
+    if 1600 <= elo < 1850:
         return 1.0          # the 'average team charged by a win' sweet spot
-    if 1600 <= elo < 1680:
+    if 1500 <= elo < 1600:
         return 0.75
     return 0.55             # minnow result = noisy, regresses
 
@@ -43,23 +47,23 @@ def main():
     base = dict(c.execute("SELECT team, rating FROM elo_base")) \
         if c.execute("SELECT name FROM sqlite_master WHERE name='elo_base'").fetchone() \
         else dict(c.execute("SELECT team, rating FROM elo"))
-    crowd = dict(c.execute("SELECT team, boost FROM crowd_support"))
     c.execute("""CREATE TABLE IF NOT EXISTS team_momentum(
         team TEXT PRIMARY KEY, mom_elo REAL)""")
     c.execute("DELETE FROM team_momentum")
 
     # use each team's LAST played match
     last = {}
-    for h, hg, ag, a in c.execute(
-            "SELECT home, hg, ag, away FROM match_results ORDER BY rowid"):
-        last[h] = (h, hg, ag, a, "H")
-        last[a] = (h, hg, ag, a, "A")
+    for h, hg, ag, a, rnd in c.execute(
+            "SELECT home, hg, ag, away, round FROM match_results ORDER BY rowid"):
+        last[h] = (h, hg, ag, a, rnd, "H")
+        last[a] = (h, hg, ag, a, rnd, "A")
 
     log = []
-    for team, (h, hg, ag, a, side) in last.items():
-        vh = HOST_ELO if h in HOSTS else crowd.get(h, 0.0)
-        va = HOST_ELO if a in HOSTS else crowd.get(a, 0.0)
-        we_h = 1 / (1 + 10 ** (-((base[h] + vh) - (base[a] + va)) / 400))
+    for team, (h, hg, ag, a, rnd, side) in last.items():
+        # expectation has to price in who was at home, or a home win over a
+        # slightly better side reads as a shock when it was the likelier result
+        vh = T.venue_elo(rnd or "md1")
+        we_h = 1 / (1 + 10 ** (-((base[h] + vh) - base[a]) / 400))
         if side == "H":
             we, gf, ga = we_h, hg, ag
         else:
@@ -69,7 +73,7 @@ def main():
         amp = tier_amp(base[team])
         mom = MOM_K * raw * amp
         # wounded giant: strong side that lost regroups (soften the penalty)
-        if raw < 0 and base[team] >= 1950:
+        if raw < 0 and base[team] >= 1850:
             mom *= 0.5
         # a convincing win adds a touch more belief; a hammering adds doubt
         margin = gf - ga
