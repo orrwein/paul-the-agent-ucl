@@ -8,3 +8,4 @@ preview-*.png
 data/backtest_cache/
 .venv/
 data/soccerdata/
+downloaded_files/
