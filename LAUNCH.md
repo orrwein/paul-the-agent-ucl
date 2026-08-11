@@ -65,10 +65,16 @@ Ordered by when it can first be done.
       Do **not** tune these to match the bookmakers exactly. The market is a
       sanity check, not ground truth; matching it perfectly would mean we have
       no independent signal at all.
-- [ ] **Odds ingestion.** `soccer_uefa_champs_league` is not yet an active
-      market on the-odds-api — only the qualifying rounds are listed. The main
-      market should open near the season. Until it does, `W_MKT = 0.62` is
-      unused and the model runs permanently in its weaker Elo+form mode.
+- [ ] **`ingest.py --odds` against the real market.** Built and verified
+      end-to-end against the qualification market (same code path, 14 EU books,
+      de-vigged to `sum(1/o) = 1.0000`), but `soccer_uefa_champs_league` was
+      not yet listed as active — it should open near the season. Until the
+      first successful pull, `W_MKT = 0.62` sits unused and the model runs in
+      its weaker Elo+form mode. Budget ~1 credit per pull against 500/month.
+- [ ] **`xg_update.py` on the real field.** Expect roughly 20 of 36 clubs on
+      measured xG and the rest rescaled from Elo. Check the coverage line: if a
+      big-five club lands in the *rescaled* list, that is an alias miss, not a
+      coverage gap. Re-run every week or two by hand — deliberately not in CI.
 - [ ] **Lock futures** — champion and top scorer, before the first kickoff.
 - [ ] **`round.py md1`**, then verify a second run changes nothing.
 - [ ] **Dry-run the deploy workflow** and confirm Pages publishes.
@@ -106,4 +112,7 @@ Ordered by when it can first be done.
 | `COUNTER_RATIO = 0.45` | A declared prior. Not fitted, not currently fittable |
 | Two-legged tie logic | Correct by construction and unit-checked, never run on a real tie |
 | `teams.pot` | Not supplied by the feed; hand entry required |
+| Odds ingestion | Code verified on the qualification market; never run on the real one |
+| xG for non-big-five clubs | Rescaled from Elo via a line fitted to the 20 covered clubs, and clamped. Ordering is right; the compression at the bottom end is a real approximation |
+| Understat access | Reached through a TLS-fingerprint shim. May break, and may fail outright from a datacenter IP — another reason it is manual |
 | Accuracy vs upstream's 75.8% | Not comparable. World Cup group stages contain genuine mismatches; a 36-club Champions League field does not |
