@@ -23,6 +23,30 @@ import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def _load_dotenv():
+    """Read KEY=value lines from a gitignored .env at the repo root.
+
+    API keys need to reach the scripts from three places: an interactive
+    shell, a scheduled run, and GitHub Actions. A file the repo knows about
+    covers the first two without anyone having to remember an export, and
+    real environment variables still win — which is what lets CI inject the
+    same key from a secret with no file present.
+    """
+    path = os.path.join(ROOT, ".env")
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip('"\''))
+
+
+_load_dotenv()
+
 # Which season's database to read/write. Defaults to the season in progress;
 # point PAUL_DB at a different file to track another competition without
 # touching a single line of code. data/wc2026.db is the upstream project's
