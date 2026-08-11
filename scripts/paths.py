@@ -6,13 +6,16 @@ want to reuse this engine for the next tournament (Euro 2028, WC 2030, ...)
 you'd have to find-and-replace the filename in two dozen files.
 
 Instead, every script does ``from paths import DB`` and this module is the
-single place that resolves it -- defaulting to the 2026 archive, but fully
+single place that resolves it -- defaulting to the current season, but fully
 overridable via environment variables so a fresh season is just:
 
-    export PAUL_DB=data/euro2028.db
-    export PAUL_TOURNAMENT="2028 UEFA European Championship"
+    export PAUL_DB=data/ucl2728.db
+    export PAUL_TOURNAMENT="2027/28 UEFA Champions League"
     python3 scripts/init_db.py
     ...
+
+This module answers *which database*. Its companion ``tournament.py`` answers
+*what format* -- rounds, table cutlines, bracket bands, home advantage.
 
 See README.md's "Starting a new tournament" section for the full walkthrough.
 """
@@ -20,10 +23,11 @@ import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Which season's database to read/write. Defaults to the 2026 World Cup
-# archive (now a closed, final record) -- point PAUL_DB at a different file
-# to track a new tournament without touching a single line of code.
-DB = os.environ.get("PAUL_DB", os.path.join(ROOT, "data", "wc2026.db"))
+# Which season's database to read/write. Defaults to the season in progress;
+# point PAUL_DB at a different file to track another competition without
+# touching a single line of code. data/wc2026.db is the upstream project's
+# closed 2026 World Cup archive and is kept here as a finished record.
+DB = os.environ.get("PAUL_DB", os.path.join(ROOT, "data", "ucl2627.db"))
 
 # Human-facing tournament name, used by the site export and README examples.
-TOURNAMENT = os.environ.get("PAUL_TOURNAMENT", "2026 FIFA World Cup")
+TOURNAMENT = os.environ.get("PAUL_TOURNAMENT", "2026/27 UEFA Champions League")

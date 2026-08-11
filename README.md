@@ -1,21 +1,27 @@
-# Paul the Agent 🐙
+# Paul the Agent — Champions League 🐙
 
-A slick, self-grading dashboard for FIFA World Cup predictions — the
-spiritual successor to Paul the Octopus, only this one shows its work. An
-ensemble model (Dixon–Coles + Elo + momentum) locks a scoreline **before**
-kickoff, then grades itself against real results — no hindsight, no edits.
+A slick, self-grading dashboard for football predictions — the spiritual
+successor to Paul the Octopus, only this one shows its work. An ensemble model
+(Dixon–Coles + Elo + momentum) locks a scoreline **before** kickoff, then grades
+itself against real results — no hindsight, no edits.
 
-**Live site:** https://nakashon.github.io/paul-the-agent/
+This fork points the engine at the **2026/27 UEFA Champions League**: a 36-team
+Swiss league phase (8 matches each, one table) followed by two-legged knockouts.
 
-**Final record — 2026 FIFA World Cup:** 75.8% outcome accuracy (69/91) and an
-11.0% exact-scoreline rate across every graded match. Both season-long
-futures — Champion (Spain) and Golden Boot (Kylian Mbappé, 10 goals) — were
-locked before the tournament started and held all the way to the final
-whistle. See the live site's "Final Report" section for the full retrospective.
+**Live site:** https://orrwein.github.io/paul-the-agent-ucl/
 
-This repo is open source (MIT licensed) and built to be reused: the pipeline
-is generic across tournaments — point it at a new database and it runs the
-same way for the next one.
+## Credit
+
+Forked from [nakashon/paul-the-agent](https://github.com/nakashon/paul-the-agent)
+(MIT). The original ran the 2026 FIFA World Cup and finished on **75.8% outcome
+accuracy (69/91)** with an 11.0% exact-scoreline rate, calling both season-long
+futures — Champion (Spain) and Golden Boot (Kylian Mbappé, 10 goals) — before a
+ball was kicked. That archive is preserved here in `data/wc2026.db`; the new
+season lives in `data/ucl2627.db`, selected via `PAUL_DB`.
+
+The modelling core — Dixon–Coles scoreline matrix, Elo backbone, and the
+EV-optimal pick selector — is upstream's work. This fork replaces the
+World-Cup-shaped scaffolding around it with a config-driven tournament layer.
 
 ## What it shows
 

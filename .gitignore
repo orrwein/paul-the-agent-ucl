@@ -3,3 +3,5 @@ __pycache__/
 .DS_Store
 .playwright-mcp/
 preview-*.png
+.claude/
+.env
