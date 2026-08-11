@@ -1,76 +1,65 @@
-"""Paul the Agent — unified best-model engine for WC2026 scoreline prediction.
+"""Paul the Agent — unified best-model engine for scoreline prediction.
 
 ENSEMBLE of three opponent-aware signals fused into per-team expected goals
 (lambda_home, lambda_away), then a Dixon-Coles scoreline matrix, then
-outcome-first scoreline selection (maximise the +1 outcome point, then pick the
+outcome-first scoreline selection (maximise the outcome point, then pick the
 most likely exact score within that outcome for the bonus).
 
 Signals
 -------
-1. ELO (backbone, opponent-adjusted strength). eloratings.net scale + home/host
-   adjustment. Converted to a goal supremacy and combined with a base total.
-2. FORM (scoring tendency). Recent goals-for / goals-against, CONFEDERATION-
-   ADJUSTED so goals piled up vs weak confederations are discounted (fixes the
-   Japan-over-Netherlands distortion).
+1. ELO (backbone, opponent-adjusted strength). ClubElo scale + home advantage.
+   Converted to a goal supremacy and combined with a base total.
+2. FORM (scoring tendency). Recent goals-for / goals-against, LEAGUE-ADJUSTED
+   so goals piled up against weak domestic opposition are discounted (a 3-0 in
+   the Eredivisie is not a 3-0 in the Premier League).
 3. MARKET (when available). Bookmaker 1X2 (+ optional total) implied
    probabilities, the single strongest public signal; blended with high weight.
 
 Final lambda = weighted blend of available signals. Dixon-Coles rho corrects
 low-score / draw probabilities. Calibrated, transparent, and refreshable as the
-tournament progresses (re-fit form & elo after each matchday).
+season progresses (re-fit form & elo after each matchday).
+
+Fixtures and market odds live in the database, not in this file — see
+``scripts/ingest.py``. This module is a library plus a small CLI that prints
+the model's card for one round; ``scripts/round.py`` is what locks picks in.
 """
 import os
 import sqlite3
+import sys
 from math import exp, factorial, log
 
 from paths import DB
+import tournament as T
+
 MAXG = 9
 RHO = -0.11               # Dixon-Coles low-score dependence
 DRAW_BOOST = 1.0          # diagonal (draw) inflation, calibrated from results
+# NOTE: the four constants below were fitted to international football by the
+# upstream World Cup build. Club football scores higher and ClubElo's ratings
+# have a different spread, so scripts/backtest.py re-fits them against the
+# completed 2025/26 season. Until that runs, treat these as placeholders.
 BASE_TOTAL = 2.65         # avg goals/game anchor for Elo component
 ELO_TO_GOALS = 0.34       # goals of supremacy per 100 Elo
 MU = 1.33                 # avg goals per team for form component
-HOST_ELO = 80             # full host advantage (true home nations only)
-CROWD_ELO = 38            # CONMEBOL diaspora "feels-like-home" crowd in the Americas
-NEUTRAL_ELO = 0           # World Cup = neutral venue; nominal "home" slot gets nothing
-HOSTS = {"Mexico", "Canada", "USA"}
 # ensemble weights. Market odds aggregate everything the public knows, so when
-# present they dominate match DIRECTION; Elo/form/crowd/intel mainly shape the
-# exact SCORELINE (where our competition edge actually lives).
+# present they dominate match DIRECTION; Elo/form/intel mainly shape the exact
+# SCORELINE (where our competition edge actually lives).
 W_NO_MKT = dict(elo=0.60, form=0.40, mkt=0.0)
 W_MKT = dict(elo=0.22, form=0.16, mkt=0.62)
 
-FIXTURES = [
-    ("A", "Mexico", "South Africa"), ("A", "South Korea", "Czechia"),
-    ("B", "Canada", "Bosnia and Herzegovina"), ("B", "Qatar", "Switzerland"),
-    ("C", "Brazil", "Morocco"), ("C", "Haiti", "Scotland"),
-    ("D", "USA", "Paraguay"), ("D", "Australia", "Turkiye"),
-    ("E", "Germany", "Curacao"), ("E", "Ivory Coast", "Ecuador"),
-    ("F", "Netherlands", "Japan"), ("F", "Sweden", "Tunisia"),
-    ("G", "Belgium", "Egypt"), ("G", "Iran", "New Zealand"),
-    ("H", "Spain", "Cape Verde"), ("H", "Saudi Arabia", "Uruguay"),
-    ("I", "France", "Senegal"), ("I", "Iraq", "Norway"),
-    ("J", "Argentina", "Algeria"), ("J", "Austria", "Jordan"),
-    ("K", "Portugal", "DR Congo"), ("K", "Uzbekistan", "Colombia"),
-    ("L", "Ghana", "Panama"), ("L", "England", "Croatia"),
-]
 
-# optional market 1X2 decimal odds: match -> (home, draw, away)
-MARKET_1X2 = {
-    ("Mexico", "South Africa"): (1.44, 4.55, 9.20),
-    ("South Korea", "Czechia"): (2.65, 3.05, 2.85),
-    ("Canada", "Bosnia and Herzegovina"): (1.82, 3.50, 4.30),
-    ("USA", "Paraguay"): (2.02, 3.25, 3.90),
-    # Matchday-1 remainder — live market odds (Jun 16-17)
-    ("France", "Senegal"): (1.54, 4.55, 7.69),
-    ("Argentina", "Algeria"): (1.43, 4.76, 9.09),
-    ("Austria", "Jordan"): (1.43, 5.56, 8.33),
-    ("Iraq", "Norway"): (11.1, 7.69, 1.33),
-    ("Portugal", "DR Congo"): (1.35, 5.88, 12.5),
-    ("Uzbekistan", "Colombia"): (8.33, 5.0, 1.47),
-    ("Ghana", "Panama"): (2.56, 3.85, 2.86),
-    ("England", "Croatia"): (1.75, 4.17, 5.26),
-}
+def load_fixtures(con, round_id):
+    """(home, away) pairs for one round, in kickoff order."""
+    return [(h, a) for h, a in con.execute(
+        "SELECT home, away FROM fixtures WHERE round=? ORDER BY kickoff, id",
+        (round_id,))]
+
+
+def load_market(con):
+    """(home, away) -> (oh, od, oa) decimal 1X2, for whatever we have prices on."""
+    return {(h, a): (oh, od, oa) for h, a, oh, od, oa in con.execute(
+        "SELECT home, away, oh, od, oa FROM market_odds "
+        "WHERE oh IS NOT NULL AND od IS NOT NULL AND oa IS NOT NULL")}
 
 
 def pois(k, lam):
@@ -81,7 +70,10 @@ def load():
     con = sqlite3.connect(DB)
     elo = dict(con.execute("SELECT team, rating FROM elo"))
     form = {t: (gf, ga) for t, gf, ga in con.execute("SELECT team, gf, ga FROM team_form")}
-    conf = dict(con.execute("SELECT name, confederation FROM teams"))
+    # `conf` is the team -> strength-bucket map. It used to be the team's
+    # confederation; for club football it's the domestic league code. The
+    # weighting code below doesn't care which, only that it maps into `cw`.
+    conf = dict(con.execute("SELECT name, league FROM teams"))
     cw = dict(con.execute("SELECT confederation, w FROM confed_weight"))
     try:
         cals = dict(con.execute("SELECT key, value FROM model_cal"))
@@ -91,15 +83,11 @@ def load():
     except sqlite3.OperationalError:
         cal = 1.0
     # player intel: per-team Elo deltas (injuries / suspensions / rotation)
-    global ADJ, CROWD
+    global ADJ
     try:
         ADJ = dict(con.execute("SELECT team, elo_delta FROM team_adjust"))
     except sqlite3.OperationalError:
         ADJ = {}
-    try:
-        CROWD = dict(con.execute("SELECT team, boost FROM crowd_support"))
-    except sqlite3.OperationalError:
-        CROWD = {}
     # momentum: temporary psychological Elo bonus from the previous match,
     # largest for AVERAGE teams that pulled off a (surprise) win.
     global MOM, GKQ
@@ -118,44 +106,40 @@ def load():
     return elo, form, conf, cw, cal
 
 
-# ---- venue / crowd model ----
-# At a World Cup only USA/Canada/Mexico are truly home. Other teams get a
-# data-driven "feels-like-home" boost based on actual fan-base size in the
-# Americas (diaspora + global followings), from the crowd_support table.
+# ---- venue model ----
+# Club football is simpler than a World Cup here: there are no host nations and
+# no diaspora "feels-like-home" crowd to model, just a real home team in a real
+# home stadium. One number, from tournament.HOME_ELO, applied to the side in
+# the home slot — and nothing at all at the neutral final.
 # ADJ holds per-team Elo deltas from player intel (injuries, suspensions, rotation).
 ADJ = {}
-CROWD = {}
 MOM = {}
 GKQ = {}
 
-def venue_boost(team, conf):
-    if team in HOSTS:
-        return HOST_ELO
-    return CROWD.get(team, 0.0)
+
+def venue_boost(is_home, round_id):
+    return T.venue_elo(round_id) if is_home else 0.0
 
 
 # ---- signal 1: Elo ----
-def elo_lambdas(elo, conf, home, away):
-    eh = elo[home] + venue_boost(home, conf) + ADJ.get(home, 0.0) + MOM.get(home, 0.0)
-    ea = elo[away] + venue_boost(away, conf) + ADJ.get(away, 0.0) + MOM.get(away, 0.0)
+def elo_lambdas(elo, home, away, round_id="md1"):
+    eh = elo[home] + venue_boost(True, round_id) + ADJ.get(home, 0.0) + MOM.get(home, 0.0)
+    ea = elo[away] + venue_boost(False, round_id) + ADJ.get(away, 0.0) + MOM.get(away, 0.0)
     sup = (eh - ea) / 100 * ELO_TO_GOALS
     return BASE_TOTAL / 2 + sup / 2, BASE_TOTAL / 2 - sup / 2
 
 
-# ---- signal 2: confederation-adjusted form ----
-def form_lambdas(form, conf, cw, att_mean, dfn_mean, home, away):
+# ---- signal 2: league-adjusted form ----
+def form_lambdas(form, conf, cw, att_mean, dfn_mean, home, away, round_id="md1"):
     def att(t):
         return (form[t][0] * cw[conf[t]]) / att_mean
     def leak(t):
         return (form[t][1] / cw[conf[t]]) / dfn_mean
-    # crowd lift on a team's attacking output, by identity (not fixture slot),
-    # scaled from the data-driven crowd_support boost
-    def crowd(t):
-        if t in HOSTS:
-            return 1.15
-        return 1.0 + CROWD.get(t, 0.0) / 500.0
-    return (MU * att(home) * leak(away) * crowd(home),
-            MU * att(away) * leak(home) * crowd(away))
+    # Home lift on attacking output. Scaled off the same Elo-denominated home
+    # advantage so there is one dial to fit, not two.
+    lift = 1.0 + T.venue_elo(round_id) / 500.0
+    return (MU * att(home) * leak(away) * lift,
+            MU * att(away) * leak(home))
 
 
 # ---- signal 3: market 1X2 -> lambdas (grid search match to implied probs) ----
@@ -202,11 +186,11 @@ def matrix(lh, la):
     return [[v / s for v in r] for r in m]
 
 
-def predict(home, away, data, exact_pts=3, dir_pts=1):
-    elo, form, conf, cw, att_mean, dfn_mean, cal = data
-    le_h, le_a = elo_lambdas(elo, conf, home, away)
-    lf_h, lf_a = form_lambdas(form, conf, cw, att_mean, dfn_mean, home, away)
-    mk = MARKET_1X2.get((home, away))
+def predict(home, away, data, exact_pts=3, dir_pts=1, round_id="md1"):
+    elo, form, conf, cw, att_mean, dfn_mean, cal, market = data
+    le_h, le_a = elo_lambdas(elo, home, away, round_id)
+    lf_h, lf_a = form_lambdas(form, conf, cw, att_mean, dfn_mean, home, away, round_id)
+    mk = market.get((home, away))
     w = W_MKT if mk else W_NO_MKT
     if mk:
         lm_h, lm_a = market_lambdas(mk)
@@ -243,41 +227,47 @@ def build_data():
     elo, form, conf, cw, cal = load()
     att_mean = sum(form[t][0] * cw[conf[t]] for t in form) / len(form)
     dfn_mean = sum(form[t][1] / cw[conf[t]] for t in form) / len(form)
-    return (elo, form, conf, cw, att_mean, dfn_mean, cal)
+    con = sqlite3.connect(DB)
+    market = load_market(con)
+    con.close()
+    return (elo, form, conf, cw, att_mean, dfn_mean, cal, market)
 
 
-def main():
-    data = build_data()
-    cal = data[6]
-    print(f"goal_cal = {cal:.3f}")
-    print(f"{'Grp':3} {'Match':42} {'BET':6} {'Winner':14} {'xG':11} W/D/L%   src")
-    print("-" * 100)
+def card(round_id, data=None):
+    """Print the model's read on one round. Read-only — locks nothing."""
+    data = data or build_data()
+    rnd = T.get_round(round_id)
+    con = sqlite3.connect(DB)
+    fixtures = load_fixtures(con, round_id)
+    con.close()
+    if not fixtures:
+        print(f"No fixtures loaded for {round_id}. Run scripts/ingest.py first.")
+        return []
+
+    print(f"{rnd.label} — goal_cal = {data[6]:.3f}"
+          f"{'  (neutral venue)' if rnd.neutral else ''}")
+    print(f"{'Match':46} {'BET':7} {'Winner':22} {'xG':12} W/D/L%   src")
+    print("-" * 104)
     rows = []
-    for grp, h, a in FIXTURES:
-        r = predict(h, a, data)
+    for h, a in fixtures:
+        r = predict(h, a, data, round_id=round_id)
         w = h if r["bet_out"] == "HOME" else (a if r["bet_out"] == "AWAY" else "Draw")
         src = "ELO+FORM+MKT" if r["used_mkt"] else "ELO+FORM"
         conf = max(r["pw"], r["pd"], r["pl"])
+        # a '*' means the EV-optimal scoreline sits in a different outcome than
+        # the single most likely one — chasing the exact-score bonus.
         flag = " *" if r["bet_out"] != r["out"] else ""
-        rows.append((grp, h, a, r["ph"], r["pa"], w, round(conf, 3)))
-        print(f"{grp:3} {h+' v '+a:42} {r['ph']}-{r['pa']:<4} {w+flag:14} "
-              f"{r['lh']:.2f}/{r['la']:<5.2f} {r['pw']*100:.0f}/{r['pd']*100:.0f}/{r['pl']*100:.0f}"
-              f"   {src}")
+        rows.append((h, a, r["ph"], r["pa"], w, round(conf, 4), int(r["used_mkt"])))
+        print(f"{h + ' v ' + a:46} {r['ph']}-{r['pa']:<5} {w + flag:22} "
+              f"{r['lh']:.2f}/{r['la']:<6.2f} "
+              f"{r['pw']*100:.0f}/{r['pd']*100:.0f}/{r['pl']*100:.0f}   {src}")
+    return rows
 
-    # persist refreshed card (skip games already played so we don't clobber locked bets)
-    con = sqlite3.connect(DB)
-    played = set()
-    for h, a in con.execute("SELECT home, away FROM match_results"):
-        played.add(frozenset((h, a)))
-    for row in rows:
-        if frozenset((row[1], row[2])) in played:
-            continue
-        con.execute("UPDATE round1_bets SET ph=?,pa=?,winner=?,conf=? "
-                    "WHERE home=? AND away=?",
-                    (row[3], row[4], row[5], row[6], row[1], row[2]))
-    con.commit()
-    con.close()
-    print("\nPending bets refreshed in round1_bets (played games left untouched).")
+
+def main():
+    round_id = sys.argv[1] if len(sys.argv) > 1 else "md1"
+    card(round_id)
+    print("\nRead-only. To lock these in: python3 scripts/round.py " + round_id)
 
 
 if __name__ == "__main__":
