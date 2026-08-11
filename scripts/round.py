@@ -124,21 +124,24 @@ def main():
         else:
             status = "locked"
 
-        r = M.predict(home, away, data, exact_pts=exact_pts, dir_pts=dir_pts,
-                      round_id=rnd.id)
-        winner = (home if r["bet_out"] == "HOME"
-                  else away if r["bet_out"] == "AWAY" else "Draw")
-        conf = max(r["pw"], r["pd"], r["pl"])
-        src = "ELO+FORM+MKT" if r["used_mkt"] else "ELO+FORM"
-
-        leg = 1
+        # A second leg is modelled with the tie's aggregate in hand: the side
+        # that needs goals plays differently from the side sitting on a lead.
+        leg, deficit = 1, 0
         if rnd.legs == 2:
             ctx = leg1_context(con, rnd.id, home, away)
             if ctx is not None:
                 leg = 2
+                deficit = ctx[0] - ctx[1]
                 status += f" (agg {ctx[0]}-{ctx[1]})"
             if not args.dry_run:
                 upsert_tie(con, rnd.id, home, away)
+
+        r = M.predict(home, away, data, exact_pts=exact_pts, dir_pts=dir_pts,
+                      round_id=rnd.id, deficit=deficit)
+        winner = (home if r["bet_out"] == "HOME"
+                  else away if r["bet_out"] == "AWAY" else "Draw")
+        conf = max(r["pw"], r["pd"], r["pl"])
+        src = "ELO+FORM+MKT" if r["used_mkt"] else "ELO+FORM"
 
         print(f"{home + ' v ' + away:46} {r['ph']}-{r['pa']:<5} {winner:22} "
               f"{conf*100:5.1f}%  {src:12} {status}")

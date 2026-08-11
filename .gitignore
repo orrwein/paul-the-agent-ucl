@@ -5,3 +5,4 @@ __pycache__/
 preview-*.png
 .claude/
 .env
+data/backtest_cache/

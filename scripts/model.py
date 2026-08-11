@@ -121,6 +121,37 @@ def venue_boost(is_home, round_id):
     return T.venue_elo(round_id) if is_home else 0.0
 
 
+# ---- two-legged tie state ----
+# The second leg of a knockout tie is not a standalone match. A side trailing
+# on aggregate has to chase: it commits players forward, which lifts its own
+# expected goals AND its opponent's, because the game opens up at both ends.
+# A side protecting a lead does the reverse, but less strongly — killing a game
+# off is harder than opening one up.
+#
+# One parameter, not two, and deliberately so: ~44 historical second legs is
+# not enough data to identify separate chase and counter-attack effects. CHASE
+# is fitted in scripts/backtest.py; COUNTER_RATIO is held as a prior.
+CHASE = 0.11            # lift to the trailing side's xG, per goal of deficit
+COUNTER_RATIO = 0.45    # share of that lift the leading side also gets
+DEFICIT_CAP = 3         # beyond three goals the tie is over and effort tails off
+
+
+def leg_tilt(lh, la, deficit):
+    """Adjust a second leg's lambdas for the aggregate going into it.
+
+    `deficit` is the home side's aggregate lead from the first leg: positive
+    means tonight's home team is ahead, negative means they are chasing.
+    """
+    if not deficit:
+        return lh, la
+    d = max(-DEFICIT_CAP, min(DEFICIT_CAP, deficit))
+    chase = CHASE * abs(d)
+    counter = chase * COUNTER_RATIO
+    if d < 0:                       # home side trails, so home chases
+        return lh * (1 + chase), la * (1 + counter)
+    return lh * (1 + counter), la * (1 + chase)
+
+
 # ---- signal 1: Elo ----
 def elo_lambdas(elo, home, away, round_id="md1"):
     eh = elo[home] + venue_boost(True, round_id) + ADJ.get(home, 0.0) + MOM.get(home, 0.0)
@@ -186,7 +217,7 @@ def matrix(lh, la):
     return [[v / s for v in r] for r in m]
 
 
-def predict(home, away, data, exact_pts=3, dir_pts=1, round_id="md1"):
+def predict(home, away, data, exact_pts=3, dir_pts=1, round_id="md1", deficit=0):
     elo, form, conf, cw, att_mean, dfn_mean, cal, market = data
     le_h, le_a = elo_lambdas(elo, home, away, round_id)
     lf_h, lf_a = form_lambdas(form, conf, cw, att_mean, dfn_mean, home, away, round_id)
@@ -203,6 +234,9 @@ def predict(home, away, data, exact_pts=3, dir_pts=1, round_id="md1"):
     gk_a = GKQ.get(away, 1.0)   # away's keeper -> scales goals home scores
     lh = (w["elo"] * le_h + w["form"] * lf_h) * gk_a * cal + w["mkt"] * lm_h * cal
     la = (w["elo"] * le_a + w["form"] * lf_a) * gk_h * cal + w["mkt"] * lm_a * cal
+    # applied last, on the blended lambdas: chasing a tie changes how a side
+    # plays tonight, not how good it is
+    lh, la = leg_tilt(lh, la, deficit)
     lh, la = max(lh, 0.2), max(la, 0.2)
     m = matrix(lh, la)
     pw = sum(m[i][j] for i in range(MAXG) for j in range(MAXG) if i > j)

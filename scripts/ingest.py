@@ -70,23 +70,29 @@ STAGE_MAP = {
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
-def _get(url, headers=None, retries=3):
+def _get(url, headers=None, retries=5, timeout=60):
+    """GET with exponential backoff.
+
+    ClubElo is a small free service that throttles bursts by simply not
+    answering, so a timeout here is a signal to slow down rather than a
+    failure — hence retrying on socket timeouts, not just HTTP errors.
+    """
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=headers or {})
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.read().decode("utf-8")
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < retries - 1:
-                # free tier is 10/min; back off and try again
-                time.sleep(20)
+            if e.code in (429, 503) and attempt < retries - 1:
+                time.sleep(20 * (attempt + 1))
                 continue
             raise SystemExit(f"{url} -> HTTP {e.code} {e.reason}")
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
             if attempt < retries - 1:
-                time.sleep(3)
+                time.sleep(5 * (attempt + 1))
                 continue
-            raise SystemExit(f"{url} -> {e.reason}")
+            reason = getattr(e, "reason", e)
+            raise SystemExit(f"{url} -> {reason}")
 
 
 def fd_get(path):

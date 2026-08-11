@@ -102,6 +102,21 @@ def precompute(data, teams, round_id):
     return out
 
 
+# Second legs need a sampler per (pairing, aggregate state), since a side
+# chasing a two-goal deficit plays a different match from one protecting a
+# lead. That is up to seven variants per pairing, so they are built on demand
+# and cached rather than precomputed — most never come up.
+_LEG2 = {}
+
+
+def leg2_sampler(data, home, away, round_id, deficit):
+    key = (home, away, round_id, deficit)
+    if key not in _LEG2:
+        r = M.predict(home, away, data, round_id=round_id, deficit=deficit)
+        _LEG2[key] = make_sampler(M.matrix(r["lh"], r["la"]))
+    return _LEG2[key]
+
+
 # ---------------------------------------------------------------------------
 # League phase
 # ---------------------------------------------------------------------------
@@ -139,13 +154,16 @@ def run_league(teams, fixtures, played, samplers):
 # ---------------------------------------------------------------------------
 # Knockout phase
 # ---------------------------------------------------------------------------
-def play_tie(seed, other, samplers_by_round, round_id):
+def play_tie(seed, other, samplers_by_round, round_id, data):
     """Two legs, aggregate, then extra time and penalties. `seed` hosts leg 2."""
     s = samplers_by_round[round_id]
     # leg 1 at the lower-ranked club
     g1_h, g1_a = sample(s[(other, seed)])
-    # leg 2 at the seed
-    g2_h, g2_a = sample(s[(seed, other)])
+    # leg 2 at the seed, played with the aggregate in hand. From the seed's
+    # point of view (tonight's home side) the lead carried in is what it
+    # scored away minus what it conceded there.
+    deficit = g1_a - g1_h
+    g2_h, g2_a = sample(leg2_sampler(data, seed, other, round_id, deficit))
     agg_seed = g1_a + g2_h
     agg_other = g1_h + g2_a
     if agg_seed != agg_other:
@@ -168,7 +186,7 @@ def single_match(a, b, samplers_by_round, round_id):
     return a if random.random() < 0.5 else b
 
 
-def run_knockout(table, samplers_by_round, stats):
+def run_knockout(table, samplers_by_round, stats, data):
     """table is the finishing order, index 0 = 1st. Returns the champion."""
     rank = {t: i + 1 for i, t in enumerate(table)}
     by_rank = {i + 1: t for i, t in enumerate(table)}
@@ -186,7 +204,7 @@ def run_knockout(table, samplers_by_round, stats):
         unseeded = [by_rank[u_lo], by_rank[u_hi]]
         random.shuffle(unseeded)
         po_winners[band] = [
-            play_tie(seeds[i], unseeded[i], samplers_by_round, "ko_po")
+            play_tie(seeds[i], unseeded[i], samplers_by_round, "ko_po", data)
             for i in range(2)]
 
     # --- round of 16: band A is 1/2 v the winners out of band IV, and so on.
@@ -196,7 +214,7 @@ def run_knockout(table, samplers_by_round, stats):
         challengers = po_winners[feeder][:]
         random.shuffle(challengers)
         r16_winners[band] = [
-            play_tie(seeds[i], challengers[i], samplers_by_round, "r16")
+            play_tie(seeds[i], challengers[i], samplers_by_round, "r16", data)
             for i in range(2)]
 
     # --- quarters: A v D and B v C, seeded side (better league finish) hosts leg 2
@@ -205,7 +223,7 @@ def run_knockout(table, samplers_by_round, stats):
         pairs = list(zip(r16_winners[left], r16_winners[right]))
         for x, y in pairs:
             seed, other = (x, y) if rank[x] < rank[y] else (y, x)
-            sf_teams.append(play_tie(seed, other, samplers_by_round, "qf"))
+            sf_teams.append(play_tie(seed, other, samplers_by_round, "qf", data))
     for t in sf_teams:
         stats[t]["semi"] += 1
 
@@ -214,7 +232,7 @@ def run_knockout(table, samplers_by_round, stats):
     for i in range(0, len(sf_teams), 2):
         x, y = sf_teams[i], sf_teams[i + 1]
         seed, other = (x, y) if rank[x] < rank[y] else (y, x)
-        finalists.append(play_tie(seed, other, samplers_by_round, "sf"))
+        finalists.append(play_tie(seed, other, samplers_by_round, "sf", data))
     for t in finalists:
         stats[t]["final"] += 1
 
@@ -248,7 +266,7 @@ def main():
     stats = defaultdict(lambda: defaultdict(int))
     for _ in range(N_SIMS):
         table = run_league(teams, fixtures, played, league_samplers)
-        run_knockout(table, samplers_by_round, stats)
+        run_knockout(table, samplers_by_round, stats, data)
 
     rows = sorted(
         ((stats[t]["title"] / N_SIMS, stats[t]["final"] / N_SIMS,
