@@ -151,8 +151,11 @@ def lambdas(elo_h, elo_a, p, neutral=False):
     return p["base_total"] / 2 + sup / 2, p["base_total"] / 2 - sup / 2
 
 
+_FACT = [factorial(k) for k in range(MAXG + 1)]
+
+
 def pois(k, lam):
-    return lam ** k * exp(-lam) / factorial(k)
+    return lam ** k * exp(-lam) / _FACT[k]
 
 
 def dc_tau(i, j, lh, la, rho):
@@ -232,14 +235,29 @@ def fit(rows):
     # RHO and DRAW_BOOST — chosen together to minimise log-loss, since both
     # move the low-score corner of the matrix and fitting either alone just
     # pushes the error into the other.
-    best = (1e9, p["rho"], p["draw_boost"])
-    for rho in [x / 100 for x in range(-25, 6)]:
-        for boost in [1.0 + x / 20 for x in range(0, 13)]:
-            q = dict(p, rho=rho, draw_boost=boost)
-            ll = log_loss(rows, q, neutral)
-            if ll < best[0]:
-                best = (ll, rho, boost)
-    p["rho"], p["draw_boost"] = best[1], best[2]
+    #
+    # Searched coarse-then-fine over a range wide enough to contain the answer
+    # in either direction. An earlier version bounded rho at +0.05 and
+    # draw_boost at 1.0 and duly returned exactly those values — a solution
+    # sitting on its own boundary is the search telling you the box is too
+    # small, not that it found an optimum.
+    def search(rho_vals, boost_vals):
+        best = (1e9, p["rho"], p["draw_boost"])
+        for rho in rho_vals:
+            for boost in boost_vals:
+                ll = log_loss(rows, dict(p, rho=rho, draw_boost=boost), neutral)
+                if ll < best[0]:
+                    best = (ll, rho, boost)
+        return best
+
+    _, rho, boost = search([x / 20 for x in range(-8, 9)],       # -0.40..0.40
+                           [0.60 + x / 10 for x in range(0, 11)])  # 0.60..1.60
+    _, rho, boost = search([rho + x / 100 for x in range(-4, 5)],
+                           [max(0.05, boost + x / 50) for x in range(-4, 5)])
+    p["rho"], p["draw_boost"] = round(rho, 3), round(boost, 3)
+    if abs(p["rho"]) > 0.38 or p["draw_boost"] < 0.65 or p["draw_boost"] > 1.55:
+        print(f"  !! fit still near a boundary (rho={p['rho']}, "
+              f"draw_boost={p['draw_boost']}) — widen the search")
     return p
 
 
@@ -256,11 +274,21 @@ def log_loss(rows, p, neutral):
 # Grading
 # ---------------------------------------------------------------------------
 def grade(rows, p, label):
+    """Score the model on this set, against the baselines it has to beat.
+
+    Accuracy is reported because it is legible, but it is NOT the objective:
+    this project bets a scoreline and is paid dir_pts for the right outcome
+    and exact_pts for the right score. A naive "stronger team wins" rule can
+    match it on accuracy while scoring nothing at all on exact scorelines, so
+    points-per-match is the comparison that actually reflects the product.
+    """
     neutral = {r[0]: T.get_round(r[0]).neutral for r in rows}
     n = len(rows)
     hit = exact = 0
     brier = ll = 0.0
     baseline_home = baseline_elo = 0
+    obs = {"H": 0, "D": 0, "A": 0}
+    goals = 0
     for rid, _, _, hg, ag, eh, ea in rows:
         lh, la = lambdas(eh, ea, p, neutral[rid])
         m = matrix(max(lh, 0.15), max(la, 0.15), p)
@@ -278,11 +306,22 @@ def grade(rows, p, label):
         ll -= log(got[actual])
         baseline_home += actual == "H"
         baseline_elo += actual == ("H" if eh + p["home_elo"] >= ea else "A")
+        obs[actual] += 1
+        goals += hg + ag
+
+    # League-phase scoring: 1 for the outcome, 3 for the exact score. An exact
+    # hit is by definition also an outcome hit, so it is worth 2 more, not 4.
+    pts = (hit + 2 * exact) / n
+    base_pts = baseline_elo / n
 
     print(f"  {label:26} n={n:4}  acc={hit/n*100:5.1f}%  exact={exact/n*100:4.1f}%  "
           f"brier={brier/n:.3f}  logloss={ll/n:.3f}")
-    print(f"  {'':26}       always-home={baseline_home/n*100:5.1f}%  "
-          f"stronger-Elo-wins={baseline_elo/n*100:5.1f}%")
+    print(f"  {'':26}       baselines: always-home={baseline_home/n*100:5.1f}%  "
+          f"stronger-Elo={baseline_elo/n*100:5.1f}%")
+    print(f"  {'':26}       pts/match: model={pts:.3f}  stronger-Elo={base_pts:.3f}  "
+          f"({(pts/base_pts-1)*100:+.0f}%)")
+    print(f"  {'':26}       actual H/D/A={obs['H']/n*100:.0f}/{obs['D']/n*100:.0f}/"
+          f"{obs['A']/n*100:.0f}  goals/match={goals/n:.2f}")
     return hit / n
 
 
