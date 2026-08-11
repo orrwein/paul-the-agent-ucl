@@ -6,6 +6,7 @@ Usage
     python3 scripts/ingest.py --elo                 # club ratings (no key needed)
     python3 scripts/ingest.py --teams --fixtures    # after the league-phase draw
     python3 scripts/ingest.py --results --scorers   # after each matchday
+    python3 scripts/ingest.py --odds                # bookmaker 1X2 consensus
     python3 scripts/ingest.py --all                 # everything, in order
 
 Sources
@@ -53,6 +54,13 @@ FD_BASE = "https://api.football-data.org/v4"
 FD_COMPETITION = os.environ.get("PAUL_FD_COMPETITION", "CL")
 FD_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN")
 ALIASES = os.path.join(ROOT, "data", "aliases.json")
+
+# the-odds-api. Free tier is 500 credits a month and one poll costs a credit
+# per region per market, so a single --odds call per matchday is comfortable.
+ODDS_BASE = "https://api.the-odds-api.com/v4"
+ODDS_SPORT = os.environ.get("PAUL_ODDS_SPORT", "soccer_uefa_champs_league")
+ODDS_REGIONS = os.environ.get("PAUL_ODDS_REGIONS", "eu")
+ODDS_KEY = os.environ.get("ODDS_API_KEY")
 
 # football-data stage -> our round id. League-phase matchdays get their number
 # appended (LEAGUE_STAGE + matchday 3 -> md3).
@@ -403,6 +411,82 @@ def ingest_results(con):
     return wrote
 
 
+def ingest_odds(con):
+    """Bookmaker 1X2 into market_odds — the model's strongest single signal.
+
+    model.py reserves 62% of the blend weight for the market when prices are
+    available, so an empty market_odds table means the whole engine runs
+    permanently in its weaker Elo+form mode. This is the plumbing that closes
+    that gap.
+
+    Consensus is built by de-vigging each bookmaker separately and averaging
+    the resulting probabilities, rather than averaging the raw prices. Books
+    carry different margins; averaging prices would blend a 3% book with an 8%
+    book and quietly inherit the difference.
+    """
+    if not ODDS_KEY:
+        raise SystemExit(
+            "ODDS_API_KEY is not set.\n"
+            "  Register (free): https://the-odds-api.com\n"
+            "  Then add ODDS_API_KEY=... to .env")
+    url = (f"{ODDS_BASE}/sports/{ODDS_SPORT}/odds/?apiKey={ODDS_KEY}"
+           f"&regions={ODDS_REGIONS}&markets=h2h&oddsFormat=decimal")
+    try:
+        body = _get(url)
+    except SystemExit as e:
+        if "422" in str(e) or "404" in str(e):
+            print(f"  odds: market {ODDS_SPORT!r} is not live yet — the UEFA "
+                  f"league-phase market opens near the season. Nothing to do.")
+            return 0
+        raise
+    events = json.loads(body)
+    if not events:
+        print(f"  odds: no events priced for {ODDS_SPORT} yet")
+        return 0
+
+    known = {r[0] for r in con.execute("SELECT name FROM teams")}
+    aliases = load_aliases()
+    now = datetime.now(timezone.utc).isoformat()
+    wrote, unmatched = 0, set()
+    for ev in events:
+        home = match_club(ev["home_team"], known, aliases)
+        away = match_club(ev["away_team"], known, aliases)
+        if not home or not away:
+            unmatched.update(x for x, r in ((ev["home_team"], home),
+                                            (ev["away_team"], away)) if not r)
+            continue
+        acc, books = [0.0, 0.0, 0.0], 0
+        for bm in ev.get("bookmakers", []):
+            for mkt in bm.get("markets", []):
+                if mkt.get("key") != "h2h":
+                    continue
+                price = {o["name"]: o["price"] for o in mkt.get("outcomes", [])}
+                trio = [price.get(ev["home_team"]), price.get("Draw"),
+                        price.get(ev["away_team"])]
+                if not all(trio) or any(p <= 1 for p in trio):
+                    continue
+                inv = [1 / p for p in trio]
+                s = sum(inv)                      # the book's overround
+                for i in range(3):
+                    acc[i] += inv[i] / s
+                books += 1
+        if not books:
+            continue
+        # back to fair decimal odds; market_lambdas re-normalises anyway, but
+        # storing prices keeps the table readable next to a bookmaker screen
+        oh, od, oa = (books / acc[i] for i in range(3))
+        con.execute(
+            "INSERT OR REPLACE INTO market_odds (home, away, oh, od, oa, captured_at) "
+            "VALUES (?,?,?,?,?,?)", (home, away, round(oh, 3), round(od, 3),
+                                     round(oa, 3), now))
+        wrote += 1
+
+    if unmatched:
+        print(f"  !! odds skipped for unmatched clubs: {', '.join(sorted(unmatched))}")
+    print(f"  odds: {wrote} fixtures priced from {ODDS_REGIONS} books")
+    return wrote
+
+
 def ingest_scorers(con, limit=20):
     data = fd_get(f"/competitions/{FD_COMPETITION}/scorers?limit={limit}")
     now = datetime.now(timezone.utc).isoformat()
@@ -433,6 +517,8 @@ def main():
     ap.add_argument("--elo", action="store_true")
     ap.add_argument("--results", action="store_true")
     ap.add_argument("--scorers", action="store_true")
+    ap.add_argument("--odds", action="store_true",
+                    help="bookmaker 1X2 consensus into market_odds")
     ap.add_argument("--seed-form", action="store_true",
                     help="give every club a starting form line from its Elo")
     ap.add_argument("--on", metavar="YYYY-MM-DD",
@@ -440,7 +526,7 @@ def main():
     args = ap.parse_args()
 
     if not any([args.all, args.teams, args.fixtures, args.elo, args.results,
-                args.scorers, args.seed_form]):
+                args.scorers, args.seed_form, args.odds]):
         ap.error("nothing to do — pass --all or one of the individual flags")
 
     con = sqlite3.connect(DB)
@@ -457,6 +543,8 @@ def main():
         ingest_results(con); con.commit()
     if args.all or args.scorers:
         ingest_scorers(con); con.commit()
+    if args.all or args.odds:
+        ingest_odds(con); con.commit()
     con.close()
     print("done.")
 
