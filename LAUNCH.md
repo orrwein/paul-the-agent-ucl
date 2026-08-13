@@ -56,23 +56,72 @@ Ordered by when it can first be done.
         on expected gave slopes of 0.87 and 0.92. `ELO_SHRINK = 0.90` corrects
         it to 0.90 and 0.96.
       * **When no club runs away with the field, title odds look sane.** For
-        2025/26 (top club +223 over the mean) the model gives its favourite
-        21.8%, about where a market prices one.
-      * **The gap is specific to a standout favourite.** For 2024/25, with Man
-        City +278 clear, it says 35% where the market said roughly 20%. Still
-        unexplained.
+        2025/26 (top club +201 over the mean) the model gives its favourite
+        18.1%, about where a market prices one.
+      * **The standout case has come most of the way down.** For 2024/25, with
+        Man City +250 clear, the number was 35% against a market near 20%. It
+        is now **29.0%**: −1.4 from the extra-time fix below, −4.8 from the
+        `CHASE` refit to 0.0. The remaining gap is ~9 points, not ~15.
 
-      What two seasons **cannot** settle is whether 35% is wrong. Two champions
-      is not a sample; you cannot validate a title probability from it. The
-      market is the only available benchmark, which is why this stays on the
-      list.
+      **The knockout phase has now been tested** (`validate_sim.py --only
+      ties`) — this was the leading suspect and it is now measured rather than
+      speculated about. All 44 real two-legged ties from the two seasons, each
+      replayed 6000 times through the production `play_tie`, from the ClubElo
+      snapshot of the day before leg 1:
+
+      | Elo gap | ties | predicted favourite | actual | diff (±2 s.e.) |
+      |---------|------|---------------------|--------|----------------|
+      | <50     | 11   | 54.7%               | 54.5%  | −0.2 (±30.0)   |
+      | 50–150  | 19   | 66.4%               | 57.9%  | −8.5 (±21.6)   |
+      | >150    | 14   | 85.8%               | 85.7%  | −0.1 (±18.5)   |
+      | **all** | 44   | **69.6%**           | **65.9%** | **−3.7 (±13.3)** |
+
+      Extra time and penalties match reality (13.2% / 5.0% predicted against
+      11.4% / 4.5% actual) and aggregate goals are close (6.70 predicted
+      against 6.91). The verdict below is unchanged at `CHASE` 0.0 / 0.11 /
+      0.22 (overall miss −3.7, −4.4, −4.8) and with rating noise on or off, so
+      a further `CHASE` refit will not disturb it.
+
+      **Verdict: the suspect is sized — neither cleared nor convicted.** Every
+      bucket leans the same way, the favourite going through slightly less
+      often than the model says, but no bucket is even one standard error out.
+      Expressed as one parameter (`p' = 0.5 + k(p − 0.5)`, fitted by maximum
+      likelihood over the 44 ties): **k = 0.89, 95% interval 0.29 to 1.21**,
+      comfortably containing 1.0. Pushed through the full bracket:
+
+      * At the point estimate k = 0.89, Man City goes 29.0% → **26.0%**. Tie
+        determinism buys about **a third** of the remaining distance to 20%.
+      * Reaching 20% needs k ≈ 0.4, which is inside the interval but near its
+        edge. 44 ties cannot separate 0.4 from 1.0; ~150 could.
+      * **Do not shrink to k = 0.89.** A 0.7 log-likelihood gain over 44 ties
+        is fitting the sample, and the same shrink applied to the league phase
+        would break a table that is already calibrated.
+
+      One real bug fell out of this and **is fixed**: `play_tie` sampled extra
+      time from a full 90-minute scoreline matrix, so a level tie reached
+      penalties 2.1% of the time against an actual 4.5%, and every one of
+      those surplus decisions went to the stronger side at its own ground.
+      `simulate.ET_SHARE = 1/3` scales extra time to its actual 30 minutes.
+      Effect: pens 2.1% → 5.0%, Man City −1.4 points.
+
+      What two seasons **cannot** settle is whether 29% is wrong. Two
+      champions is not a sample. For the record, PSG won both, and the
+      simulation put 82.3% and 39.0% of its title mass on clubs it rated
+      *above* the eventual winner — two draws that should be uniform on 0–100.
+      Nothing is wrong with that pair, and nothing is confirmed by it either.
 
       Remaining suspects, in order:
-      1. Two-legged ties may be too deterministic. If a tie between a strong
-         and a good club resolves nearer a coin flip than the model thinks,
-         four rounds of that compounds into exactly this error.
-      2. `ELO_TO_GOALS` (0.600) — fitted per match, and per-match calibration
-         does not guarantee correct compounding across 13 rounds.
+      1. `ELO_TO_GOALS` (0.600) — fitted per match, and per-match calibration
+         does not guarantee correct compounding across 13 rounds. **Now the
+         leading suspect.** The tie check holds the Elo gap fixed and asks
+         whether the *tie mechanics* are right; a supremacy conversion that is
+         slightly too steep would instead show up as exactly what is seen
+         above — a small, consistent, never-significant lean in every bucket,
+         which then compounds across five rounds.
+      2. Two-legged ties, still open but now bounded: worth about a third of
+         the remaining gap at the point estimate, and all of it only near the
+         edge of the interval. Re-run `--only ties` once 2026/27 adds 22 more
+         ties; that is the cheapest way to narrow k.
       3. `ELO_SIGMA` (40) — widens the distribution but does **not** fix a
          systematic tilt; that was what `ELO_SHRINK` was for.
 

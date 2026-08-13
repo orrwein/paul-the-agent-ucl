@@ -178,6 +178,31 @@ def sampler_for(data, home, away, round_id, deficit=0, shift=0):
     return hit
 
 
+# Extra time is 30 minutes, not 90. The first version of play_tie sampled ET
+# from the same full-match scoreline matrix as a leg, which quietly did two
+# wrong things: it made a level tie far too likely to be settled before
+# penalties (a full match is decisive ~84% of the time, half an hour of extra
+# time nothing like it), and every one of those extra decisions was handed out
+# in proportion to strength, at the seed's own ground. Both push level ties
+# toward the favourite when reality pushes them toward a coin flip.
+#
+# 30/90 is the honest scaling of the goal rate, and it is not fitted to
+# anything — it is the clock. Set PAUL_ET_SHARE=1.0 to reproduce the old
+# behaviour; scripts/validate_sim.py runs both and prints the difference.
+ET_SHARE = float(os.environ.get("PAUL_ET_SHARE", 1.0 / 3.0))
+
+
+def et_sampler_for(data, home, away, round_id, shift):
+    """Scoreline sampler for a period of extra time at `home`'s ground."""
+    key = (home, away, round_id, "et", shift)
+    hit = _CACHE.get(key)
+    if hit is None:
+        r = M.predict(home, away, data, round_id=round_id, elo_shift=shift)
+        hit = _CACHE[key] = make_sampler(
+            M.matrix(r["lh"] * ET_SHARE, r["la"] * ET_SHARE))
+    return hit
+
+
 def draw_shifts(teams):
     """One strength perturbation per club, in bucketed Elo points."""
     return {t: max(-SHIFT_CAP, min(SHIFT_CAP,
@@ -230,8 +255,14 @@ def run_league(teams, fixtures, played, data, shifts):
 # ---------------------------------------------------------------------------
 # Knockout phase
 # ---------------------------------------------------------------------------
-def play_tie(seed, other, round_id, data, shifts):
-    """Two legs, aggregate, then extra time and penalties. `seed` hosts leg 2."""
+def play_tie_detail(seed, other, round_id, data, shifts):
+    """Two legs, aggregate, then extra time and penalties. `seed` hosts leg 2.
+
+    Returns ``(winner, agg_seed, agg_other, how)`` where `how` is one of
+    ``"reg"``, ``"et"``, ``"pens"`` and the aggregates are the 180-minute
+    totals. ``play_tie`` is the thin wrapper the bracket uses; the detail is
+    what scripts/validate_sim.py scores against the real ties.
+    """
     fwd = pair_shift(shifts, seed, other)
     rev = pair_shift(shifts, other, seed)
     # leg 1 at the lower-ranked club
@@ -244,14 +275,21 @@ def play_tie(seed, other, round_id, data, shifts):
     agg_seed = g1_a + g2_h
     agg_other = g1_h + g2_a
     if agg_seed != agg_other:
-        return seed if agg_seed > agg_other else other
-    # Level after 180'. Extra time is another half-match; if that settles
-    # nothing, a shootout is close enough to a coin flip that pretending
-    # otherwise would be false precision.
-    et_h, et_a = sample(sampler_for(data, seed, other, round_id, 0, fwd))
+        return ((seed if agg_seed > agg_other else other),
+                agg_seed, agg_other, "reg")
+    # Level after 180'. Extra time is a THIRD of a match, not another one —
+    # see ET_SHARE. If it settles nothing, a shootout is close enough to a
+    # coin flip that pretending otherwise would be false precision.
+    et_h, et_a = sample(et_sampler_for(data, seed, other, round_id, fwd))
     if et_h != et_a:
-        return seed if et_h > et_a else other
-    return seed if random.random() < 0.5 else other
+        return ((seed if et_h > et_a else other), agg_seed, agg_other, "et")
+    return ((seed if random.random() < 0.5 else other),
+            agg_seed, agg_other, "pens")
+
+
+def play_tie(seed, other, round_id, data, shifts):
+    """Winner of a two-legged tie. `seed` hosts leg 2."""
+    return play_tie_detail(seed, other, round_id, data, shifts)[0]
 
 
 def single_match(a, b, round_id, data, shifts):
