@@ -12,16 +12,21 @@ Ordered by when it can first be done.
 
 ## Before the draw (now → 26 Aug)
 
-- [ ] **Front-end rebuild.** `export_site.py` and `docs/app.js` still speak
-      World Cup: group filters, a third-place box, an ISO map of 45 nations.
-      Doesn't need the draw.
-- [ ] **CI pipeline.** Nightly ingest → update → export, with
-      `FOOTBALL_DATA_TOKEN` and `ODDS_API_KEY` as repository secrets.
-- [ ] **Confirm Actions runs at all on this fork.** GitHub does not register a
-      parent repo's workflows on a fork until the workflow file is touched by
-      a commit or the enable banner is clicked. `gh api
-      repos/orrwein/paul-the-agent-ucl/actions/workflows` currently returns
-      zero. Editing `deploy.yml` should fix it — verify, don't assume.
+- [x] ~~**Front-end rebuild.**~~ Done — `export_site.py` and `docs/` rebuilt
+      for the Swiss format, verified in four season states.
+- [x] ~~**CI pipeline.**~~ Done — `nightly.yml` + `check.yml`, both green,
+      secrets set. The site is live and served from a nightly-generated
+      payload.
+- [x] ~~**Confirm Actions runs on this fork.**~~ All three workflows are
+      `active` and have run successfully.
+- [ ] **Watch the first few nightlies.** The very first dispatched run failed
+      usefully: unpinned football-data calls follow the feed's *current*
+      season, which stays 2025/26 until late August, so the pre-draw bootstrap
+      ingested **last season's 36 clubs as if they were the new draw**. Only a
+      downstream ClubElo timeout stopped a site built on the wrong field from
+      publishing. Fixed by pinning `PAUL_FD_SEASON`, but the lesson generalises:
+      a feed's idea of "now" is not ours, and the pre-draw window is exactly
+      when that is most dangerous.
 
 ## Draw day (27 Aug)
 
@@ -162,7 +167,33 @@ Ordered by when it can first be done.
       it was deleted rather than ported, because porting a World Cup bracket
       five months early would have been guesswork.
 - [ ] **`ko_po`/`r16` second legs** exercise `leg_tilt` for the first time in
-      anger (Feb/Mar 2027).
+      anger (Feb/Mar 2027) — though `CHASE` is now fitted to 0.0, so the tilt
+      is dormant until a third season's data revives it.
+
+## End of season (after the final, ~June 2027)
+
+- [ ] **⚠ The nightly will switch itself off, silently.** GitHub disables
+      scheduled workflows in public repositories after **60 days without
+      repository activity**, and re-enabling is manual. During the season the
+      nightly commits real data most weeks and keeps resetting that clock, so
+      it never comes up. The moment the season ends the repo goes quiet and the
+      clock starts for real: roughly **60 days after the last commit**, the cron
+      stops firing with no warning and no failed run to notice.
+
+      This is invisible until you come back for 2027/28 and find nothing has
+      updated. Either re-enable it from the Actions tab when the next season
+      approaches, or push any commit inside the window to reset the clock.
+
+      Note this is about *repository* activity, not workflow runs — a nightly
+      that runs and commits nothing (as it does pre-draw) does **not** count.
+
+- [ ] **Roll the season over.** `PAUL_FD_SEASON` (default `2026`) pins every
+      football-data call; bump it, and re-point `paths.DB` at a new season
+      database. The 2026/27 DB stays as a finished record, the way
+      `data/wc2026.db` does for the World Cup.
+- [ ] **Re-run `validate_sim.py --only ties`.** 2026/27 adds ~22 ties to the 44
+      we have, which is the cheapest available way to narrow the interval on
+      the tie-determinism question below.
 
 ---
 
@@ -170,10 +201,12 @@ Ordered by when it can first be done.
 
 | Thing | Status |
 |---|---|
-| Title-odds calibration | **Open.** ~35% favourite vs ~15–20% market, on a synthetic field |
-| `CHASE = 0.11` | A prior, not a fit. ~44 historical second legs is too thin to identify it separately from the counter-attack effect |
-| `COUNTER_RATIO = 0.45` | A declared prior. Not fitted, not currently fittable |
-| Two-legged tie logic | Correct by construction and unit-checked, never run on a real tie |
+| Title-odds calibration | **Open, but sized.** A standout favourite reads ~29% against a market ~20%. Ties explain at most a third of that; `ELO_TO_GOALS` compounding is the leading suspect |
+| `CHASE = 0.0` | Fitted, on 38 second legs whose two seasons straddle zero. "Measured to zero", not "proven absent" — `leg_tilt` stays wired so one number revives it |
+| `COUNTER_RATIO = 0.45` | A declared prior, and moot while `CHASE` is 0.0 |
+| Two-legged tie logic | Now validated against all 44 real ties (69.6% predicted favourite vs 65.9% actual, inside noise). Never run on a *live* tie |
+| Form weight `0.05` | Fitted to ~0 on Elo-seeded form, which is the only form the backtest can reconstruct. It cannot see the in-season xG signal, so this is a floor, not a verdict |
+| Scheduled workflow lifetime | Auto-disables after 60 days of repo inactivity — see End of season above |
 | `teams.pot` | Not supplied by the feed; hand entry required |
 | Odds ingestion | Code verified on the qualification market; never run on the real one |
 | xG for non-big-five clubs | Rescaled from Elo via a line fitted to the 20 covered clubs, and clamped. Ordering is right; the compression at the bottom end is a real approximation |
