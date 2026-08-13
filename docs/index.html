@@ -34,6 +34,7 @@
       <a href="#scorecard">Scorecard</a>
       <a href="#table">League table</a>
       <a href="#picks">Picks</a>
+      <a href="#revisions">Second thoughts</a>
       <a href="#bracket">Bracket</a>
       <a href="#race">Title race</a>
       <a href="#scorer">Top scorer</a>
@@ -52,7 +53,7 @@
     <section class="hero" aria-labelledby="heroTitle">
       <p class="tag" id="heroTag">2026/27 UEFA Champions League</p>
       <h1 id="heroTitle">Every match, <span class="grad">modelled &amp; scored.</span></h1>
-      <p class="lede">A Dixon–Coles + Elo engine locks a scoreline before kickoff, then grades itself against reality. Thirty-six clubs, one table, two-legged knockouts — no hindsight, no edits, just the receipts.</p>
+      <p class="lede">A Dixon–Coles + Elo engine locks a scoreline before kickoff, then grades itself against reality. Thirty-six clubs, one table, two-legged knockouts — no hindsight, nothing edited after the whistle, and every change of mind on the record.</p>
       <div class="hero-state" id="heroState"></div>
       <div class="hero-stats" id="heroStats"></div>
       <p class="updated" id="updated"></p>
@@ -90,7 +91,7 @@
     <section id="picks" class="section" aria-labelledby="picksH">
       <div class="section-head">
         <h2 id="picksH">Picks vs results</h2>
-        <p>Every pick is written to the database before kickoff and never edited. Each row shows <b class="hl-pred">what Paul called</b> against <b class="hl-real">what actually happened</b>.</p>
+        <p>Every pick is written to the database before kickoff and never touched once the whistle goes. Bets stay changeable until kickoff, so Paul may revise one when late team news lands — every version is kept, and the ones that changed say so. Each row shows <b class="hl-pred">what Paul called</b> against <b class="hl-real">what actually happened</b>.</p>
       </div>
       <ul class="legend" id="legend">
         <li><i class="lg-dot d-exact" aria-hidden="true"></i>Exact score</li>
@@ -100,6 +101,14 @@
       </ul>
       <div class="filters" id="filters" role="group" aria-label="Filter picks by round"></div>
       <div id="pickList"></div>
+    </section>
+
+    <section id="revisions" class="section" aria-labelledby="revisionsH">
+      <div class="section-head">
+        <h2 id="revisionsH">Second thoughts</h2>
+        <p>A bet can be changed until kickoff, so the honest question is whether changing it helps. Every version of every pick is kept; this scores <b>what the first call would have earned</b> against <b>what the final call actually earned</b>, using the same rules either way. If revising is losing points, it says so.</p>
+      </div>
+      <div id="revisionsWrap"></div>
     </section>
 
     <section id="bracket" class="section" aria-labelledby="bracketH">

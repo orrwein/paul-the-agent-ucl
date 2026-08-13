@@ -1,9 +1,12 @@
 """Paul the Agent — unified best-model engine for scoreline prediction.
 
 ENSEMBLE of three opponent-aware signals fused into per-team expected goals
-(lambda_home, lambda_away), then a Dixon-Coles scoreline matrix, then
-outcome-first scoreline selection (maximise the outcome point, then pick the
-most likely exact score within that outcome for the bonus).
+(lambda_home, lambda_away), then a Dixon-Coles scoreline matrix, then the
+EV-optimal bet on that matrix under the round's scoring rules.
+
+Which bet the rules make optimal is NOT decided here — ``scripts/scoring.py``
+owns that, and owns grading it too, so the rule the model optimises and the
+rule the site pays out on cannot drift apart.
 
 Signals
 -------
@@ -29,6 +32,7 @@ import sys
 from math import exp, factorial, log
 
 from paths import DB
+import scoring as S
 import tournament as T
 
 MAXG = 9
@@ -353,8 +357,19 @@ def matrix(lh, la):
     return [[v / s for v in r] for r in m]
 
 
-def predict(home, away, data, exact_pts=3, dir_pts=1, round_id="md1", deficit=0,
+def predict(home, away, data, rules=None, round_id="md1", deficit=0,
             elo_shift=0.0):
+    """Model one match and return the bet the round's rules make optimal.
+
+    `rules` is a scoring.Rules; omitted, it is the active rulebook's entry for
+    `round_id`. That default is a change of behaviour worth naming: this used
+    to fall back to hardcoded exact_pts=3 / dir_pts=1 whatever the round, so
+    model.card("final") printed a pick optimised for league-phase points while
+    round.py locked a different one optimised for 8/15. Only round.py passed
+    the right numbers; every other caller silently got the league-phase rule.
+    Callers that only want lambdas (simulate, topscorer, calibrate, form_update)
+    are unaffected either way — they read lh/la, never the pick.
+    """
     elo, form, conf, cw, att_mean, dfn_mean, cal, market = data
     le_h, le_a = elo_lambdas(elo, home, away, round_id, elo_shift)
     lf_h, lf_a = form_lambdas(form, conf, cw, att_mean, dfn_mean, home, away, round_id)
@@ -376,22 +391,19 @@ def predict(home, away, data, exact_pts=3, dir_pts=1, round_id="md1", deficit=0,
     lh, la = leg_tilt(lh, la, deficit)
     lh, la = max(lh, 0.2), max(la, 0.2)
     m = matrix(lh, la)
-    pw = sum(m[i][j] for i in range(MAXG) for j in range(MAXG) if i > j)
-    pd = sum(m[i][i] for i in range(MAXG))
-    pl = 1 - pw - pd
+    pw, pd, pl = S.outcome_probs(m)
     out = "HOME" if pw >= max(pd, pl) else ("DRAW" if pd >= pl else "AWAY")
-    # EV-optimal scoreline: maximise exact_pts*P(s) + dir_pts*(P(direction)-P(s))
-    pdir = {"HOME": pw, "DRAW": pd, "AWAY": pl}
-    best = None  # (i, j, ev)
-    for i in range(MAXG):
-        for j in range(MAXG):
-            cls = "HOME" if i > j else ("DRAW" if i == j else "AWAY")
-            ev = exact_pts * m[i][j] + dir_pts * (pdir[cls] - m[i][j])
-            if best is None or ev > best[2]:
-                best = (i, j, ev)
-    bcls = "HOME" if best[0] > best[1] else ("DRAW" if best[0] == best[1] else "AWAY")
+    # The EV-optimal scoreline is chosen by scripts/scoring.py, which is the
+    # single owner of what a bet is worth. It used to be inlined here, in
+    # backtest.py and in export_site.py at once; three copies of a rule that
+    # must change together is how the model ends up optimising one rulebook
+    # while the site scores another.
+    rules = rules or S.rules_for(round_id)
+    pick = S.choose(m, rules, round_id=round_id, deficit=deficit)
+    bcls = {"H": "HOME", "D": "DRAW", "A": "AWAY"}[pick["outcome"]]
     return dict(lh=lh, la=la, pw=pw, pd=pd, pl=pl, out=out, bet_out=bcls,
-                ph=best[0], pa=best[1], ev=best[2], used_mkt=bool(mk))
+                ph=pick["ph"], pa=pick["pa"], ev=pick["ev"],
+                used_mkt=bool(mk), ruleset=rules.ruleset)
 
 
 def build_data():

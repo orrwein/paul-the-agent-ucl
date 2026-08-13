@@ -27,6 +27,12 @@ Honesty rules this obeys
   Fitting and grading on the same matches measures memorisation, not skill.
 * Snapshots are cached to disk, so a re-run reproduces the same numbers even
   after ClubElo has moved on.
+* The scoring rule is IMPORTED (scripts/scoring.py), not re-implemented. This
+  file still refuses to import model.py — that would execute against the live
+  database — but a rule the fitter optimises and the site pays out on must be
+  one rule, so scoring.py is written to have no import-time side effects
+  precisely so this file can use it. form_lambdas below is still a hand-copy,
+  and is the remaining instance of the problem.
 
 What it fits
 ------------
@@ -67,6 +73,7 @@ from math import exp, factorial, log
 
 from paths import ROOT
 import ingest
+import scoring as S
 import tournament as T
 
 CACHE = os.path.join(ROOT, "data", "backtest_cache")
@@ -289,9 +296,12 @@ def matrix(lh, la, p):
 
 
 def probs(m):
-    pw = sum(m[i][j] for i in range(MAXG) for j in range(MAXG) if i > j)
-    pd = sum(m[i][i] for i in range(MAXG))
-    return pw, pd, max(1 - pw - pd, 1e-12)
+    """Kept as a name, delegated as a body — scoring.py owns the definition now.
+
+    It has to be the same arithmetic in the same order as the one the bet is
+    chosen with, or the fitter grades a slightly different model than it fits.
+    """
+    return S.outcome_probs(m)
 
 
 def rho_ceiling(rows, p, lam=None):
@@ -606,19 +616,30 @@ def scoreline_loss(rows, p, neutral, lam=None):
 # ---------------------------------------------------------------------------
 # Grading
 # ---------------------------------------------------------------------------
-def score_rows(rows, p, lam=None, exact_pts=3, dir_pts=1):
+def score_rows(rows, p, lam=None, rules=None):
     """Grade the model the way the product is actually paid.
 
-    round.py does not bet the most likely scoreline, it bets the EV-optimal one
-    (model.predict): maximise exact_pts*P(score) + dir_pts*P(outcome minus that
-    score). With 3 and 1 that is argmax of 2*P(score) + P(outcome), which will
-    happily bet 1-1 in a match it thinks the home side probably wins. Grading
-    the argmax cell instead — which this function used to do — measures a model
-    nobody ships and understates both accuracy and points.
+    round.py does not bet the most likely scoreline, it bets the EV-optimal one.
+    Grading the argmax cell instead — which this function used to do — measures
+    a model nobody ships and understates both accuracy and points.
+
+    Both halves of that, choosing the bet and paying it, now come from
+    scripts/scoring.py rather than from a hand-copy of model.predict that lived
+    here. This file still refuses to import model.py, and for the same reason as
+    ever: model.load() executes against whatever database paths.py resolved, and
+    a fitter that reads the live season is not a fitter. scoring.py has no
+    import-time side effects and never opens a connection, so importing it is
+    safe — which is exactly what kills the copy.
+
+    `rules` defaults to the league phase, which is what these 378 matches are
+    graded under (the knockout rounds in the cache are graded as matches, not
+    as ties, and the cache carries no round-level rule of its own).
     """
+    rules = rules or S.rules_for("md1")
     neutral = {r.rid: T.get_round(r.rid).neutral for r in rows}
     n = len(rows)
     hit = exact = 0
+    pts = 0
     brier = ll = sll = 0.0
     baseline_home = baseline_elo = 0
     obs = {"H": 0, "D": 0, "A": 0}
@@ -634,18 +655,13 @@ def score_rows(rows, p, lam=None, exact_pts=3, dir_pts=1):
         p00_pred += m[0][0]
         p00_obs += (r.hg == 0 and r.ag == 0)
         pdir = {"H": pw, "D": pd, "A": pl}
-        bi = bj = 0
-        bev = -1.0
-        for x in range(MAXG):
-            for y in range(MAXG):
-                cls = "H" if x > y else ("D" if x == y else "A")
-                ev = exact_pts * m[x][y] + dir_pts * (pdir[cls] - m[x][y])
-                if ev > bev:
-                    bev, bi, bj = ev, x, y
-        pick = "H" if bi > bj else ("D" if bi == bj else "A")
+        bet = S.choose(m, rules, round_id=r.rid, leg=r.leg, deficit=r.deficit)
         actual = "H" if r.hg > r.ag else ("D" if r.hg == r.ag else "A")
-        hit += pick == actual
-        exact += (bi, bj) == (r.hg, r.ag)
+        g, earned = S.award(bet, (r.hg, r.ag), rules,
+                            round_id=r.rid, leg=r.leg, deficit=r.deficit)
+        hit += g in ("exact", "dir")
+        exact += g == "exact"
+        pts += earned
         brier += sum((pdir[k] - (1.0 if k == actual else 0.0)) ** 2
                      for k in ("H", "D", "A"))
         ll -= log(pdir[actual])
@@ -655,12 +671,17 @@ def score_rows(rows, p, lam=None, exact_pts=3, dir_pts=1):
         obs[actual] += 1
         goals += r.hg + r.ag
 
-    # League-phase scoring: 1 for the outcome, 3 for the exact score. An exact
-    # hit is by definition also an outcome hit, so it is worth 2 more, not 4.
+    # Points come from scoring.award, summed above, rather than from a formula
+    # re-derived from the rule ((hit + 2*exact) was the old one, correct only
+    # while the rule is 1 and 3). The baseline is a rule the model does not
+    # play — "stronger Elo wins", no scoreline named — so it can only ever
+    # collect the direction payment, and that is written out rather than
+    # awarded.
     return dict(n=n, acc=hit / n, exact=exact / n, brier=brier / n, ll=ll / n,
-                sll=sll / n, pts=(hit + 2 * exact) / n,
+                sll=sll / n, pts=pts / n,
                 base_home=baseline_home / n, base_elo=baseline_elo / n,
-                base_pts=baseline_elo / n, obs=obs, goals=goals / n,
+                base_pts=baseline_elo * rules.get("dir_pts", 0) / n,
+                obs=obs, goals=goals / n,
                 p00_pred=p00_pred / n, p00_obs=p00_obs / n,
                 pred_total=pred_total / n)
 

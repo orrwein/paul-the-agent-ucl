@@ -31,6 +31,7 @@ import sqlite3
 import sys
 
 from paths import DB
+import scoring as S
 import tournament as T
 
 
@@ -127,12 +128,16 @@ def main():
         "SELECT ph, pa, winner FROM locked_bets WHERE round=? AND home=? AND away=?",
         (rnd.id, home, away)).fetchone()
     if pick:
-        exact = (pick[0], pick[1]) == (args.hg, args.ag)
-        actual = "HOME" if args.hg > args.ag else ("AWAY" if args.ag > args.hg else "DRAW")
-        picked = ("HOME" if pick[0] > pick[1]
-                  else "AWAY" if pick[1] > pick[0] else "DRAW")
-        verdict = "EXACT" if exact else ("outcome" if picked == actual else "miss")
-        print(f"  Paul had {pick[0]}-{pick[1]} ({pick[2]}) -> {verdict}")
+        # This used to be a fourth hand-rolled copy of the verdict — the same
+        # rule as the model's selector, the fitter's grader and the site's,
+        # minus the points. It is scoring.award now, so a console line and the
+        # published scorecard cannot disagree about what a pick was worth.
+        rules = S.load_rules(con).get(rnd.id) or S.rules_for(rnd.id)
+        g, pts = S.award({"ph": pick[0], "pa": pick[1]},
+                         (args.hg, args.ag), rules, round_id=rnd.id)
+        verdict = {"exact": "EXACT", "dir": "outcome", "miss": "miss"}.get(g, "?")
+        print(f"  Paul had {pick[0]}-{pick[1]} ({pick[2]}) -> {verdict}, "
+              f"{pts} pt{'' if pts == 1 else 's'}")
     else:
         print("  no locked pick for this fixture")
     con.close()

@@ -15,18 +15,23 @@ Tables
 teams          - one row per qualified club (pot, domestic league, coefficient)
 fixtures       - the schedule, one row per match, tagged with its round
 market_odds    - bookmaker 1X2 prices per fixture, when we have them
-locked_bets    - our picks. ONE table for every round (the World Cup build had
-                 nine near-identical locked_bets_* tables; with 13 rounds that
-                 does not scale). Tagged by round, never overwritten once set.
+locked_bets    - our CURRENT pick per fixture. ONE table for every round (the
+                 World Cup build had nine near-identical locked_bets_* tables;
+                 with 13 rounds that does not scale). Tagged by round.
+bet_history    - every version of every pick, append-only. locked_bets holds
+                 what we are betting now; this holds what we ever bet.
 ties           - two-legged knockout ties and their running aggregate
 match_results  - actual scores as they come in
 elo/team_form  - model inputs, refreshed each matchday
-scoring        - points per round for the self-grading scorecard
+scoring        - which scoring ruleset is active for each round (the rules
+                 themselves live in scripts/scoring.py — see its docstring for
+                 why they are versioned in code rather than stored here)
 """
 import os
 import sqlite3
 
 from paths import DB
+import scoring as S
 import tournament as T
 
 
@@ -56,8 +61,11 @@ CREATE TABLE IF NOT EXISTS market_odds (
     PRIMARY KEY (home, away)
 );
 
--- One locked pick per fixture. `provisional` marks a pick made before the
--- opponent was certain; `used_mkt` records whether market odds fed the model.
+-- One locked pick per fixture — the CURRENT one. `provisional` marks a pick
+-- made before the opponent was certain; `used_mkt` records whether market odds
+-- fed the model. The primary key is the invariant that matters: exactly one
+-- live bet per fixture, which is why the history below is a separate table
+-- rather than a `latest` flag on this one.
 CREATE TABLE IF NOT EXISTS locked_bets (
     round TEXT NOT NULL,
     home TEXT NOT NULL,
@@ -145,14 +153,53 @@ CREATE TABLE IF NOT EXISTS scoring (
     round TEXT PRIMARY KEY, dir_pts INTEGER, exact_pts INTEGER);
 """
 
-# Points per round. The league phase is 144 low-stakes matches, so each is
-# worth little; the knockouts are few and decisive, so they carry the weight.
-# Same escalating shape the World Cup build used, stretched over 13 rounds.
-SCORING = (
-    [(r.id, 1, 3) for r in T.LEAGUE_ROUNDS]
-    + [("ko_po", 2, 5), ("r16", 3, 6), ("qf", 4, 8), ("sf", 5, 10), ("final", 8, 15)]
-)
+# Kept as its own constant because scripts/round.py executes it too, to migrate
+# a database created before pick history existed. One DDL, two callers, no
+# chance of the migration and the fresh schema disagreeing.
+BET_HISTORY_DDL = """
+-- Every version of every pick, append-only. Match bets are changeable right up
+-- to kickoff, so `round.py --refresh` stopped being a rare escape hatch and
+-- became routine; overwriting locked_bets in place would mean the site grades
+-- a moving target, and at season's end nobody could tell whether Paul was
+-- right or merely changed his mind late and kept the good version.
+--
+-- version 1 is the first call and is written at the same time as the first
+-- locked_bets row, so this table is a complete record on its own and never
+-- needs joining back to reconstruct what was originally bet.
+--
+-- `ruleset` names the scripts/scoring.py rulebook the pick was optimised
+-- under. Together with git history that makes the arithmetic behind any pick
+-- reconstructable later, which is the whole claim this project makes.
+--
+-- `origin` is 'lock' (first call), 'refresh' (a pre-kickoff revision), or
+-- 'backfill' (a pick that already existed when this table was added — its
+-- earlier versions, if any, are simply gone, which is why this is being built
+-- before matchday 1 rather than after it).
+CREATE TABLE IF NOT EXISTS bet_history (
+    id INTEGER PRIMARY KEY,
+    round TEXT NOT NULL,
+    home TEXT NOT NULL,
+    away TEXT NOT NULL,
+    leg INTEGER NOT NULL DEFAULT 1,
+    version INTEGER NOT NULL,
+    ph INTEGER, pa INTEGER,
+    winner TEXT,
+    conf REAL,
+    used_mkt INTEGER DEFAULT 0,
+    ruleset TEXT,
+    origin TEXT,
+    locked_at TEXT,
+    UNIQUE (round, home, away, version)
+);
+CREATE INDEX IF NOT EXISTS ix_bet_history_match
+    ON bet_history (round, home, away, version);
+"""
 
+SCHEMA += BET_HISTORY_DDL
+
+# Points per round used to be spelled out here. They now come from
+# scripts/scoring.py's active rulebook, so this file seeds the table rather
+# than defining it — the rule and the row that names it cannot disagree.
 FUTURES_PTS = [("champion", 12), ("top_scorer", 12)]
 
 
@@ -161,10 +208,16 @@ def main():
     con = sqlite3.connect(DB)
     c = con.cursor()
     c.executescript(SCHEMA)
+    # Adds the `ruleset` column to a scoring table that predates it. Idempotent,
+    # and a no-op on the table just created — but this script is run against
+    # existing databases too, and re-running it must never reset one.
+    S.ensure_schema(con)
 
-    for round_id, dir_pts, exact_pts in SCORING:
-        c.execute("INSERT OR REPLACE INTO scoring VALUES (?,?,?)",
-                  (round_id, dir_pts, exact_pts))
+    scoring_rows = S.seed_rows()
+    for round_id, dir_pts, exact_pts, ruleset in scoring_rows:
+        c.execute("INSERT OR REPLACE INTO scoring "
+                  "(round, dir_pts, exact_pts, ruleset) VALUES (?,?,?,?)",
+                  (round_id, dir_pts, exact_pts, ruleset))
 
     for code, w in T.LEAGUE_WEIGHT.items():
         c.execute("INSERT OR REPLACE INTO confed_weight VALUES (?,?)", (code, w))
@@ -184,7 +237,8 @@ def main():
     con.close()
     print(f"{T.TOURNAMENT}")
     print(f"DB initialised at {os.path.abspath(DB)}")
-    print(f"  {len(SCORING)} rounds scored, "
+    print(f"  {len(scoring_rows)} rounds scored under ruleset "
+          f"'{S.ACTIVE_RULESET}', "
           f"{len(T.LEAGUE_WEIGHT)} league weights, "
           f"{len(FUTURES_PTS)} futures")
     print("  teams, pots and fixtures come from scripts/ingest.py "

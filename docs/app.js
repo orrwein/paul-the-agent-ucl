@@ -371,6 +371,9 @@ function pickRow(m, rnd) {
       <div class="pm-box b-pred">
         <div class="pm-cap">Paul</div>
         <div class="pm-val${hasPick ? "" : " pm-wait"}">${hasPick ? `${m.ph}–${m.pa}` : "not picked"}</div>
+        ${m.first_ph != null
+          ? `<div class="pm-first" title="Revised before kickoff. Every version is kept.">first ${m.first_ph}–${m.first_pa}</div>`
+          : ""}
       </div>
       <div class="pm-box b-real">
         <div class="pm-cap">Actual</div>
@@ -423,6 +426,96 @@ function renderPicks(d) {
       </div>
       <div class="pick-list">${r.matches.map((m) => pickRow(m, r)).join("")}</div>
     </section>`).join("");
+}
+
+/* -------------------------------------------------------------- revisions */
+/* Did changing our mind help? Bets stay changeable until kickoff, so a site
+ * that quietly republished its latest opinion would be grading a moving
+ * target. The payload keeps every version and scores the first call against
+ * the final one; this draws the answer whichever way it points.
+ *
+ * The POINTS are internal (README, "Internal scoring") and ride the same
+ * show-pts toggle as everywhere else. What is public is the direction and the
+ * count — which is the part a reader actually needs to judge the honesty of
+ * the scorecard above. */
+const GRADE_WORD = { exact: "exact score", dir: "right winner", miss: "miss" };
+
+function renderRevisions(d) {
+  const wrap = $("revisionsWrap");
+  wrap.innerHTML = "";
+  const r = d.revisions;
+
+  if (!r) {
+    wrap.appendChild(emptyBox(
+      "No pick history yet.",
+      d.state.phase === "pre_draw"
+        ? `Nothing has been picked — the draw is on <b>${esc(d.state.draw_label)}</b>. From the first lock onward every version of every pick is recorded, so this comparison exists from matchday one rather than starting whenever someone thinks to add it.`
+        : "Picks are locked but none has been revised yet, so there is nothing to compare."));
+    return;
+  }
+  if (!r.revised) {
+    wrap.appendChild(emptyBox(
+      `No pick has been changed yet, across ${r.tracked} tracked.`,
+      "Every version of every pick is recorded. Re-running the model without changing the bet is not a revision and is not counted as one."));
+    return;
+  }
+
+  // Direction comes from the points delta, so it stays correct if the rules
+  // stop being monotone in the grade. The number itself stays internal.
+  const verdict = r.delta > 0
+    ? ["good", "Gained", "Revising has gained points"]
+    : r.delta < 0
+      ? ["bad", "Cost", "Revising has cost points"]
+      : ["flat", "A wash", "Revising has neither gained nor cost points"];
+
+  const rows = r.matches.map((m) => {
+    const played = m.hg != null;
+    const cls = m.delta > 0 ? "rv-up" : m.delta < 0 ? "rv-down" : "rv-same";
+    const move = !played
+      ? `<span class="rv-pending">not played yet</span>`
+      : `<span class="${cls}">${esc(GRADE_WORD[m.grade_first] || "—")} → ${esc(GRADE_WORD[m.grade_final] || "—")}</span>`;
+    return `<tr>
+      <td class="col-team">${esc(shortName(m.home))} v ${esc(shortName(m.away))}
+        <span class="rv-round">${esc((d.rounds.find((x) => x.id === m.round) || {}).label || m.round)}</span></td>
+      <td class="rv-score">${m.first[0]}–${m.first[1]}</td>
+      <td class="rv-score rv-final">${m.final[0]}–${m.final[1]}</td>
+      <td class="rv-score">${played ? `${m.hg}–${m.ag}` : "—"}</td>
+      <td>${move}</td>
+      <td class="pts-col"><span class="pts-inline">${played ? plus(m.delta) : "—"}</span></td>
+    </tr>`;
+  }).join("");
+
+  wrap.innerHTML = `
+    <div class="cards rv-cards">
+      <div class="card">
+        <div class="big">${r.revised}</div>
+        <div class="cap">picks revised before kickoff</div>
+        <div class="sub">out of ${r.tracked} with a recorded history</div>
+      </div>
+      <div class="card">
+        <div class="big">${r.gained} / ${r.lost}</div>
+        <div class="cap">better / worse for the change</div>
+        <div class="sub">${r.same} landed on the same grade either way</div>
+      </div>
+      <div class="card rv-${verdict[0]}">
+        <div class="big">${r.graded ? esc(verdict[1]) : "—"}</div>
+        <div class="cap">${r.graded ? esc(verdict[2]) : "Nothing revised has been played yet"}</div>
+        <div class="sub">across ${r.graded} revised pick${r.graded === 1 ? "" : "s"} already played<span class="pts-inline">
+          · ${r.pts_first} pts if it had never changed its mind, ${r.pts_final} as bet</span></div>
+      </div>
+    </div>
+    <div class="tbl-scroll rv-table" tabindex="0" role="region" aria-label="Revised picks, first call against final call">
+      <table>
+        <caption>${esc(verdict[2])} so far. ${r.graded} revised pick${r.graded === 1 ? " has" : "s have"} been played — far too few to mean anything, so read this as a record of what happened rather than as evidence that revising is good or bad. Picks that were re-modelled and came back the same bet are not counted as revisions.</caption>
+        <thead><tr>
+          <th class="col-team" scope="col">Match</th>
+          <th scope="col">First call</th><th scope="col">Final call</th>
+          <th scope="col">Actual</th><th scope="col">Grade</th>
+          <th scope="col" class="pts-col"><span class="pts-inline">Δ pts</span></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
 }
 
 /* ---------------------------------------------------------------- bracket */
@@ -666,6 +759,7 @@ async function main() {
   renderTrend(d);
   renderTable(d);
   renderPicks(d);
+  renderRevisions(d);
   renderBracket(d);
   renderRace(d);
   renderScorer(d);

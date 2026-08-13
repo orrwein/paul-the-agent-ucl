@@ -3,7 +3,10 @@
 A slick, self-grading dashboard for football predictions — the spiritual
 successor to Paul the Octopus, only this one shows its work. An ensemble model
 (Dixon–Coles + Elo + momentum) locks a scoreline **before** kickoff, then grades
-itself against real results — no hindsight, no edits.
+itself against real results — no hindsight, and nothing edited after the
+whistle. Match bets stay changeable until kickoff, so every version of every
+pick is kept and the site reports whether changing its mind gained or lost
+points.
 
 This fork points the engine at the **2026/27 UEFA Champions League**: a 36-team
 Swiss league phase (8 matches each, one table) followed by two-legged knockouts.
@@ -103,10 +106,16 @@ Two details worth knowing about the nightly job:
 Automating these would be wrong, not merely unnecessary:
 
 ```bash
-python3 scripts/round.py md1        # lock a round's picks — before kickoff
-python3 scripts/futures.py          # champion + golden boot — once, pre-season
-python3 scripts/xg_update.py        # expected-goals refresh — weekly
+python3 scripts/round.py md1            # lock a round's picks — before kickoff
+python3 scripts/round.py md1 --refresh  # re-model unplayed fixtures on late news
+python3 scripts/futures.py              # champion + golden boot — once, pre-season
+python3 scripts/xg_update.py            # expected-goals refresh — weekly
 ```
+
+`--refresh` is additive: it appends a new version to `bet_history` rather than
+overwriting the old pick, refuses outright to touch a fixture that has been
+played, and writes nothing at all if the re-modelled bet comes back the same.
+Futures are locked pre-season and are not refreshable.
 
 `round.py` and `futures.py` are the only scripts that write a bet, and a pick
 must never appear as a side effect of a scheduled refresh — the whole premise is
@@ -147,14 +156,24 @@ cd docs && python -m http.server 8000
 These points power a private prediction game and are kept out of the public
 dashboard — they're documented here for reference only.
 
-| Stage | Correct outcome | Exact score |
+**These numbers are placeholders.** They were inherited from the upstream World
+Cup build and have never been checked against the competition this fork is
+actually entered in; the real rules are not yet published and are expected to be
+both different and more complex. They are named `classic_v1` and live in
+`scripts/scoring.py`, which owns *both* choosing a bet and paying it out, so the
+model cannot end up optimising one rulebook while the site scores another. The
+database names which ruleset is in force per round; the rules themselves are
+versioned in code, so the arithmetic behind any past pick stays reconstructable
+from git. When the real rules land, they arrive as a new rulebook beside this
+one — `classic_v1` is not edited once a pick has been locked under it.
+
+| Round | Correct outcome | Exact score |
 |-------|-----------------|-------------|
-| Group | 1 | 3 |
-| Round of 32 | 2 | 5 |
-| Round of 16 | 2 | 5 |
+| Matchday 1–8 (league phase) | 1 | 3 |
+| Knockout play-off | 2 | 5 |
+| Round of 16 | 3 | 6 |
 | Quarter-final | 4 | 8 |
 | Semi-final | 5 | 10 |
-| Third-place | 5 | 10 |
 | Final | 8 | 15 |
 
 Futures: champion and golden boot worth 12 pts each.

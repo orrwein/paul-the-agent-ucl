@@ -16,7 +16,10 @@ What the front-end needs, and does not get anywhere else
 This is the only place the pieces are joined. The database stores predictions
 and results in separate tables and never grades anything; the *grade* — exact /
 right-direction / miss, and the points it earned — is computed here, once, so
-the browser only has to draw it.
+the browser only has to draw it. The arithmetic itself is not ours: it comes
+from ``scripts/scoring.py``, the same module the model optimises its picks
+against, so the site cannot end up scoring a different rulebook than the one
+the bet was chosen under.
 
 Three things are derived rather than read, because nothing in the pipeline
 writes them (see REPORT notes at the bottom of the module docstring):
@@ -48,6 +51,7 @@ import zlib
 from datetime import datetime, timezone
 
 from paths import DB, TOURNAMENT
+import scoring as S
 import tournament as T
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -166,9 +170,14 @@ def load_teams(con):
     return out
 
 
-def load_scoring(con):
-    return {r: (d, e) for r, d, e in
-            _rows(con, "SELECT round, dir_pts, exact_pts FROM scoring")}
+def load_rules(con):
+    """{round_id: scoring.Rules}. The DB names the ruleset; scoring.py owns it.
+
+    Read-only safe: this connection is opened `mode=ro`, so unlike the writers
+    it never calls scoring.ensure_schema — load_rules copes with a scoring
+    table that predates the ruleset column on its own.
+    """
+    return S.load_rules(con)
 
 
 def load_fixtures(con):
@@ -195,6 +204,32 @@ def load_picks(con):
             for rid, h, a, _leg, ph, pa, w, conf, mkt, prov, at in _rows(
                 con, "SELECT round, home, away, leg, ph, pa, winner, conf, "
                      "used_mkt, provisional, locked_at FROM locked_bets")}
+
+
+def load_history(con):
+    """(round, home, away) -> [every version of that pick, oldest first].
+
+    Absent on a database written before pick history existed, and on one seeded
+    straight into locked_bets (the CI smoke fixture does exactly that), so a
+    missing table is a normal state and not an error. Everything downstream
+    treats "no history" as "nothing to say about revisions", never as "no
+    revisions happened" — those are different claims and only one of them is
+    supported by an empty table.
+    """
+    out = {}
+    try:
+        rows = _rows(con, "SELECT round, home, away, version, ph, pa, winner, "
+                          "conf, used_mkt, ruleset, origin, locked_at "
+                          "FROM bet_history ORDER BY round, home, away, version")
+    except sqlite3.OperationalError:
+        return out
+    for rid, h, a, ver, ph, pa, w, conf, mkt, ruleset, origin, at in rows:
+        out.setdefault((rid, h, a), []).append({
+            "version": ver, "ph": ph, "pa": pa, "winner": w,
+            "conf": round(conf, 4) if conf is not None else None,
+            "used_mkt": bool(mkt), "ruleset": ruleset, "origin": origin,
+            "locked_at": at})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -267,25 +302,15 @@ def build_cutlines():
 # ---------------------------------------------------------------------------
 # Picks, grading and points
 # ---------------------------------------------------------------------------
-def grade(pick, result, dir_pts, exact_pts):
-    """exact / dir / miss, and the points it actually earned.
-
-    A knockout leg is graded as the 90 minutes it was — a shootout decides who
-    goes through, not what the score was, so it never turns a predicted draw
-    into a predicted win. The tie's own outcome is graded separately, by the
-    aggregate, in build_ties.
-    """
-    hg, ag = result[0], result[1]
-    if pick["ph"] is None or pick["pa"] is None:
-        return None, 0
-    if pick["ph"] == hg and pick["pa"] == ag:
-        return "exact", exact_pts
-    if direction(pick["ph"], pick["pa"]) == direction(hg, ag):
-        return "dir", dir_pts
-    return "miss", 0
+# Grading used to be a local `grade()` here, a third independent copy of the
+# rule. It is scoring.award now. A knockout leg is still graded as the 90
+# minutes it was — award ignores the penalty columns, because a shootout
+# decides who goes through, not what the score was, so it never turns a
+# predicted draw into a predicted win. The tie's own outcome is graded
+# separately, by the aggregate, in build_ties.
 
 
-def build_rounds(con, fixtures, picks, results, scoring):
+def build_rounds(con, fixtures, picks, results, rules_by_round, history):
     """One entry per round, in competition order, each carrying its fixtures.
 
     Rounds with nothing in them yet are still emitted: the site draws the whole
@@ -294,7 +319,8 @@ def build_rounds(con, fixtures, picks, results, scoring):
     """
     out = []
     for rnd in T.ROUNDS:
-        dir_pts, exact_pts = scoring.get(rnd.id, (1, 3))
+        rules = rules_by_round.get(rnd.id) or S.rules_for(rnd.id)
+        exact_pts = rules.get("exact_pts", 0)
         keys = [k for k in fixtures if k[0] == rnd.id]
         # Anything picked or played without a fixture row still has to show up.
         keys += [k for k in picks if k[0] == rnd.id and k not in fixtures]
@@ -326,13 +352,25 @@ def build_rounds(con, fixtures, picks, results, scoring):
                             "mkt": pick["used_mkt"],
                             "provisional": pick["provisional"],
                             "locked_at": pick["locked_at"]})
+                # "first called 2-1, settled on 1-1" — only when the two differ.
+                # A pick that was re-modelled and came back the same is not a
+                # revision and does not get to look like one.
+                versions = history.get(key) or []
+                if len(versions) > 1:
+                    first = versions[0]
+                    row["versions"] = len(versions)
+                    if (first["ph"], first["pa"]) != (pick["ph"], pick["pa"]):
+                        row["first_ph"] = first["ph"]
+                        row["first_pa"] = first["pa"]
+                        row["first_at"] = first["locked_at"]
             if res:
                 row.update({"hg": res[0], "ag": res[1]})
                 if res[2] is not None and res[3] is not None:
                     row["pens"] = [res[2], res[3]]
 
             if res and pick:
-                g, p = grade(pick, res, dir_pts, exact_pts)
+                g, p = S.award(pick, res, rules, round_id=rnd.id,
+                               leg=row["leg"])
                 row["grade"], row["pts"] = g, p
                 row["status"] = "graded"
                 tally["graded"] += 1
@@ -350,7 +388,8 @@ def build_rounds(con, fixtures, picks, results, scoring):
         out.append({
             "id": rnd.id, "label": rnd.label, "phase": rnd.phase,
             "legs": rnd.legs, "neutral": rnd.neutral,
-            "dir_pts": dir_pts, "exact_pts": exact_pts,
+            "dir_pts": rules.get("dir_pts"), "exact_pts": exact_pts,
+            "ruleset": rules.ruleset,
             "matches": matches,
             "n": len(matches),
             "locked": sum(1 for m in matches if m.get("ph") is not None),
@@ -367,7 +406,7 @@ def build_rounds(con, fixtures, picks, results, scoring):
 # ---------------------------------------------------------------------------
 # Two-legged ties
 # ---------------------------------------------------------------------------
-def build_ties(con, fixtures, picks, results, scoring):
+def build_ties(con, fixtures, picks, results, rules_by_round):
     """Reconstruct each knockout tie from its two legs.
 
     ``ties`` exists in the schema but nothing fills in agg_a/agg_b/pen_*/winner
@@ -383,7 +422,10 @@ def build_ties(con, fixtures, picks, results, scoring):
     for rnd in T.KNOCKOUT_ROUNDS:
         if rnd.legs != 2:
             continue
-        dir_pts, exact_pts = scoring.get(rnd.id, (2, 5))
+        # The old fallback here was a flat (2, 5) for every knockout round,
+        # which is the play-off's rule applied to the semi-final. rules_for
+        # falls back to the round's own entry in the active rulebook instead.
+        rules = rules_by_round.get(rnd.id) or S.rules_for(rnd.id)
         legs_by_pair = {}
         for (rid, h, a), fx in fixtures.items():
             if rid != rnd.id:
@@ -419,7 +461,8 @@ def build_ties(con, fixtures, picks, results, scoring):
                         pens = ([ph, pa] if f["home"] == seed else [pa, ph])
                         row["pens"] = [ph, pa]
                     if pick:
-                        row["grade"], row["pts"] = grade(pick, res, dir_pts, exact_pts)
+                        row["grade"], row["pts"] = S.award(
+                            pick, res, rules, round_id=rnd.id, leg=f["leg"])
                 leg_rows.append(row)
 
             winner = None
@@ -836,16 +879,97 @@ def build_timeline(rounds):
 
 
 # ---------------------------------------------------------------------------
+# Did changing our mind help?
+# ---------------------------------------------------------------------------
+def build_revisions(history, picks, results, rules_by_round):
+    """First pick vs final pick, and the points the difference was worth.
+
+    Match bets are changeable until kickoff, so the model gets to revise. The
+    only honest way to publish that is to score both: what the FIRST call would
+    have earned against what the FINAL call did earn, through the same
+    scoring.award() that grades everything else. If revising loses points, this
+    says so — that is the entire reason it is measured rather than assumed.
+
+    Only fixtures that were actually revised AND have a result contribute to
+    the points comparison. An unrevised pick scores identically either way and
+    would do nothing but dilute the number toward zero, which would make late
+    changes look harmless by burying them in picks nobody changed.
+
+    Two honest limitations, both stated in the payload rather than hidden:
+      * this is a small-sample after-the-fact comparison, not evidence that
+        refreshing is good or bad in general — one exact score is worth two
+        points and there will not be many revisions in a season;
+      * it can only see revisions since bet_history existed. Picks backfilled
+        into version 1 carry whatever they carried at backfill time, and any
+        earlier version of them is gone.
+    """
+    if not history:
+        return None
+    rows = []
+    tracked = revised = 0
+    for key, versions in history.items():
+        tracked += 1
+        if len(versions) < 2:
+            continue
+        first, final = versions[0], versions[-1]
+        changed = (first["ph"], first["pa"]) != (final["ph"], final["pa"])
+        if not changed:
+            continue                     # re-modelled, same bet — not a revision
+        revised += 1
+        rid, home, away = key
+        rules = rules_by_round.get(rid) or S.rules_for(rid)
+        res = results.get(key)
+        row = {
+            "round": rid, "home": home, "away": away,
+            "first": [first["ph"], first["pa"]], "first_at": first["locked_at"],
+            "final": [final["ph"], final["pa"]], "final_at": final["locked_at"],
+            "versions": len(versions),
+            "conf_first": first["conf"], "conf_final": final["conf"],
+            "mkt_first": first["used_mkt"], "mkt_final": final["used_mkt"],
+        }
+        if res:
+            g_first, p_first = S.award(first, res, rules, round_id=rid)
+            g_final, p_final = S.award(final, res, rules, round_id=rid)
+            row.update({"hg": res[0], "ag": res[1],
+                        "grade_first": g_first, "grade_final": g_final,
+                        "pts_first": p_first, "pts_final": p_final,
+                        "delta": p_final - p_first})
+        rows.append(row)
+
+    rows.sort(key=lambda r: (r.get("delta") is None, -(r.get("delta") or 0),
+                             r["round"], r["home"]))
+    graded = [r for r in rows if "delta" in r]
+    pts_first = sum(r["pts_first"] for r in graded)
+    pts_final = sum(r["pts_final"] for r in graded)
+    # A pick that was never revised is not evidence either way, so it is
+    # counted but kept out of the arithmetic.
+    return {
+        "tracked": tracked,
+        "revised": revised,
+        "graded": len(graded),
+        "pts_first": pts_first,
+        "pts_final": pts_final,
+        "delta": pts_final - pts_first,
+        "gained": sum(1 for r in graded if r["delta"] > 0),
+        "lost": sum(1 for r in graded if r["delta"] < 0),
+        "same": sum(1 for r in graded if r["delta"] == 0),
+        "matches": rows,
+    }
+
+
+# ---------------------------------------------------------------------------
 def build_payload(con):
     teams = load_teams(con)
-    scoring = load_scoring(con)
+    rules_by_round = load_rules(con)
     fixtures = load_fixtures(con)
     picks = load_picks(con)
     results = load_results(con)
+    history = load_history(con)
 
     table = build_table(con, teams, results)
-    rounds = build_rounds(con, fixtures, picks, results, scoring)
-    ties = build_ties(con, fixtures, picks, results, scoring)
+    rounds = build_rounds(con, fixtures, picks, results, rules_by_round, history)
+    ties = build_ties(con, fixtures, picks, results, rules_by_round)
+    revisions = build_revisions(history, picks, results, rules_by_round)
     state = season_state(teams, rounds, table, ties)
     elim = eliminated_clubs(table, ties, state)
     bracket = build_bracket(table, ties, rounds, results)
@@ -871,13 +995,18 @@ def build_payload(con):
             "tie_break": list(T.TIE_BREAK),
             "rounds": [{"id": r.id, "label": r.label, "legs": r.legs,
                         "phase": r.phase, "neutral": r.neutral,
-                        "dir_pts": scoring.get(r.id, (None, None))[0],
-                        "exact_pts": scoring.get(r.id, (None, None))[1]}
+                        "dir_pts": rules_by_round[r.id].get("dir_pts"),
+                        "exact_pts": rules_by_round[r.id].get("exact_pts")}
                        for r in T.ROUNDS],
         },
         # The points game is deliberately not the public headline; the site
         # keeps it behind a toggle. See README, "Internal scoring".
+        # `ruleset` names the scripts/scoring.py rulebook every pick above was
+        # chosen and graded under, so the scorecard stays auditable after the
+        # rules change — which they will, since these are placeholders.
         "scoring": {"public": False,
+                    "ruleset": S.ACTIVE_RULESET,
+                    "rulesets": sorted({r.ruleset for r in rules_by_round.values()}),
                     "futures_pts": dict(_rows(
                         con, "SELECT kind, pts FROM futures_pts"))},
         "summary": summary,
@@ -886,6 +1015,7 @@ def build_payload(con):
         "table": table,
         "eliminated": sorted(elim),
         "rounds": rounds,
+        "revisions": revisions,
         "ties": ties,
         "bracket": bracket,
         "odds": odds,
@@ -915,6 +1045,12 @@ def main():
           f"{s['exact']} exact, {s['points']}/{s['points_max']} pts (internal)")
     print(f"  {len(payload['table'])} table rows, {len(payload['ties'])} ties, "
           f"{len(payload['odds'])} clubs in the title race")
+    rev = payload["revisions"]
+    if rev:
+        print(f"  {rev['revised']} pick(s) revised before kickoff across "
+              f"{rev['tracked']} tracked; of the {rev['graded']} already played, "
+              f"revising is {rev['delta']:+d} pts "
+              f"({rev['pts_first']} first call -> {rev['pts_final']} final)")
 
 
 if __name__ == "__main__":

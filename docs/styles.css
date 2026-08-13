@@ -284,6 +284,32 @@ tbody.b-out .band-head th { color: var(--red); }
 .v-miss { background: rgba(251,113,133,0.13); color: var(--red); }
 .v-tbd { background: rgba(255,255,255,0.05); color: var(--muted); }
 .v-none { background: transparent; color: var(--faint); }
+/* A pick that was revised before kickoff carries its first call underneath the
+   live one — the superseded bet is part of the record, not an embarrassment to
+   be tidied away, so it is legible rather than hidden. */
+.pm-first {
+  font-size: 0.62rem; font-weight: 700; color: var(--faint); margin-top: 2px;
+  text-decoration: line-through; text-decoration-color: rgba(255,255,255,0.28);
+}
+
+/* ---------------------------------------------------------- revisions */
+.rv-cards { margin-bottom: 18px; }
+.rv-good .big { color: var(--green); }
+.rv-bad .big { color: var(--red); }
+.rv-flat .big { color: var(--muted); }
+.rv-good { border-color: rgba(53,230,164,0.28); }
+.rv-bad { border-color: rgba(251,113,133,0.28); }
+.rv-table td, .rv-table th { text-align: right; }
+.rv-table .col-team { text-align: left; white-space: normal; }
+.rv-round {
+  display: block; font-size: 0.68rem; color: var(--faint); font-weight: 500;
+}
+.rv-score { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--muted); }
+.rv-final { color: var(--grad-2); }
+.rv-up { color: var(--green); font-weight: 700; }
+.rv-down { color: var(--red); font-weight: 700; }
+.rv-same { color: var(--muted); }
+.rv-pending { color: var(--faint); }
 
 /* ------------------------------------------------------------ bracket */
 .bracket-scroll { overflow-x: auto; padding-bottom: 8px; }

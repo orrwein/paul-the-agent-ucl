@@ -28,6 +28,41 @@ Ordered by when it can first be done.
       a feed's idea of "now" is not ours, and the pre-draw window is exactly
       when that is most dangerous.
 
+- [ ] **⚠ Get the competition's real scoring rules, then write them down.** The
+      points currently in the database — 1/3 in the league phase rising to 8/15
+      in the final, 12 each for the two futures — are placeholders inherited
+      from the upstream World Cup build. They have never been checked against
+      the competition this fork is entered in, and word is that the real ones
+      are both different and **more complex**: partial credit for the goal
+      difference, an upset bonus, points for one team's score, stake or
+      confidence weighting, or points for who ADVANCES in a two-legged tie
+      rather than the leg score are all live possibilities.
+
+      This is not cosmetic. `scripts/scoring.py`'s `choose()` picks the bet by
+      maximising expected points under these rules, so wrong rules mean the
+      model bets the wrong scoreline all season, not merely that the scorecard
+      totals up oddly. A rule paying for goal difference, for example, would
+      make 2-0 and 3-1 interchangeable and change which one gets bet.
+
+      The plumbing is ready: `scoring.py` owns choosing AND grading, so a rule
+      change is one file, and every call site (model, backtest, export, result)
+      already goes through it. What is deliberately NOT built is any of the
+      rules above — implementing guesses would be worse than useless. When the
+      real rules arrive:
+
+      1. add a new rulebook beside `classic_v1` in `scripts/scoring.py` —
+         **do not edit `classic_v1`** once a pick has been locked under it,
+         because `bet_history.ruleset` points back at it;
+      2. add any new terms to `KNOWN_TERMS` and teach `choose`/`award` to use
+         them (a rulebook naming a term nobody reads raises, on purpose);
+      3. point the `scoring` table's `ruleset` column at the new name;
+      4. re-run `python3 scripts/backtest.py` — the fitted constants are fitted
+         against a scoring rule, and `pts/match` is the objective.
+
+      Best done **before MD1**. Rules that change mid-season are expressible
+      (the column is per round) but every pick locked under the old ones was
+      chosen to maximise the wrong thing.
+
 ## Draw day (27 Aug)
 
 - [ ] **`ingest.py --teams --fixtures`.** First contact with real data. Expect
@@ -201,6 +236,8 @@ Ordered by when it can first be done.
 
 | Thing | Status |
 |---|---|
+| Scoring rules | **Placeholders.** `classic_v1` is the World Cup build's table, never checked against the real competition. The rules choose the bet, not just the score line, so this is a live risk — see "Before the draw" |
+| Pick history | Built and exercised on synthetic data only. `bet_history` records every version; the first-call-vs-final-call points comparison has never seen a real revision |
 | Title-odds calibration | **Open, but sized.** A standout favourite reads ~29% against a market ~20%. Ties explain at most a third of that; `ELO_TO_GOALS` compounding is the leading suspect |
 | `CHASE = 0.0` | Fitted, on 38 second legs whose two seasons straddle zero. "Measured to zero", not "proven absent" — `leg_tilt` stays wired so one number revives it |
 | `COUNTER_RATIO = 0.45` | A declared prior, and moot while `CHASE` is 0.0 |
