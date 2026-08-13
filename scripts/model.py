@@ -98,37 +98,77 @@ MU = BASE_TOTAL / 2       # avg goals per team for form component (was 1.33)
 # SCORELINE (where our competition edge actually lives).
 #
 # The elo:form split was 60:40 and was never anything but a guess inherited
-# from the World Cup build. scripts/backtest.py now fits it properly, by
-# rebuilding the form signal the way the live pipeline evolves it — Elo-seeded
-# before MD1, then folded forward after each matchday by form_update.py's rule,
-# never using a result from the match being predicted or from its own matchday.
-# Swept 0.00 to 1.00 across both seasons, cross-validated:
+# from the World Cup build. It then spent a while at 95:5, which was a HONEST
+# number fitted against the WRONG SIGNAL, and is now 70:30, fitted against the
+# right one. That history is worth keeping, because the mistake is easy to
+# repeat and the fix is the whole reason backtest.py has a stage 2b.
 #
-#     w_form   0.00    0.05    0.20    0.40    0.60    0.80    1.00
-#     pts     0.762   0.788   0.743   0.743   0.762   0.730   0.733
-#     logloss 0.8979  0.8978  0.8995  0.9034  0.9099  0.9193  0.9325
+# THE WRONG SIGNAL. backtest.py stage 2 rebuilds form the way the live pipeline
+# EVOLVES it: Elo-seeded by ingest.seed_form before MD1, then folded forward
+# after each matchday by form_update.py's rule. Swept 0..1, cross-validated,
+# that said form adds nothing — points flat and noisy, log-loss degrading
+# monotonically above 0.05. But a signal that BEGINS as a restatement of Elo,
+# nudged by at most eight European matches, cannot add much on top of Elo. The
+# sweep was close to asking whether Elo predicts itself, and 0.05 was recorded
+# at the time as "a floor the data cannot rule out" rather than a finding.
 #
-# Read that honestly and it says form adds NOTHING. Log-loss is flat to four
-# decimals between 0.00 and 0.05 and then degrades monotonically — that part
-# is a clean, consistent signal, and it is a signal that this form component
-# makes the model worse. The points peak at 0.05 is not a signal: the entire
-# gain lives in one of the two seasons (0.841 against 0.788) while the other
-# does not move at all, and one extra exact score anywhere is worth 0.011.
+# THE RIGHT SIGNAL. In season, xg_update.py OVERWRITES team_form with real
+# domestic expected goals — about 38 league matches a club rather than eight
+# European ones, from a source Elo does not directly contain. That is what the
+# model actually predicts on, and it had never been measured. Stage 2b measures
+# it, on the same two seasons, with each club's form rebuilt from only those
+# domestic matches played strictly BEFORE the matchday's first kickoff.
 #
-# So why 0.05 and not 0.00? Only because the backtest cannot see the form
-# signal the live pipeline actually uses. Historically the cache can only
-# reconstruct form that was SEEDED FROM ELO, so measuring it against Elo is
-# close to asking whether Elo predicts itself. In season, xg_update.py rebuilds
-# team_form from real domestic expected goals, which carries information Elo
-# does not. 0.05 keeps that path alive at a weight the data cannot rule out.
-# It is a floor, not a finding: nothing here supports going back above it.
-W_NO_MKT = dict(elo=0.95, form=0.05, mkt=0.0)
+# Cross-validated, on the deployed hybrid (real xG where Understat reaches, the
+# Elo-rescaled line elsewhere) over all 378 matches, 20-match rolling window:
+#
+#     w_form   0.00    0.05    0.15    0.25    0.30    0.40    0.50    0.60
+#     pts     0.762   0.775   0.743   0.738   0.728   0.733   0.735   0.701
+#     logloss 0.8980  0.8967  0.8951  0.8944  0.8944  0.8945  0.8955  0.8973
+#
+# and on the ~154 matches where BOTH clubs have real measured xG, the effect is
+# much larger: log-loss 0.9294 -> 0.9081, optimum near w=0.80.
+#
+# WHY 0.30 AND NOT THE POINTS PEAK AT 0.05. Neither metric above can resolve
+# this at n=378 — bootstrapped, every arm's log-loss AND points change against
+# w=0 has a 95% interval straddling zero. So the weight is priced by the one
+# instrument that can: regress observed goal difference on Elo-implied and
+# form-implied supremacy together, and read the form coefficient.
+#
+#     arm                          n     t on form   implied w_form
+#     xG, both clubs covered     154        +4.32    0.79 [0.67,0.84]
+#     xG, deployed hybrid        378        +2.84    0.50 [0.24,0.63]
+#     goals, both covered        154        +1.50    0.33 [0.00,0.53]
+#     goals, deployed hybrid     378        +0.39    0.08 [0.00,0.34]
+#
+# That is a real increment over Elo (p<0.0001 on the clean arm), and it is
+# corroborated: on the covered subset the regression implies 0.79 and the
+# full-model sweep independently optimises at 0.80. For the hybrid the two
+# instruments bracket 0.30-0.50, and 0.30 is the low end — chosen deliberately,
+# because the points column does drift down as the weight rises and taking the
+# conservative end of an agreed range is the cheaper mistake.
+#
+# WHY THE soccerdata DEPENDENCY SURVIVES. The control was plain domestic GOALS
+# from football-data, which needs no scraper, no TLS shim and no extra token.
+# On identical matches xG beats goals at every window tried (t = 2.32/3.17/4.32/
+# 2.98 against 0.62/1.17/1.50/2.32), and goals clear significance in only one
+# specification of four. Expected goals is where the information is; actual
+# goals is mostly the same noise Elo already sees. So the scraper earns its
+# keep — but ONLY for the ~22 of 36 clubs Understat actually reaches.
+#
+# WHAT THIS DOES NOT SAY. The Elo-rescaled two-thirds of the field carries
+# almost nothing (log-loss -0.0026 on those matches alone, and it degrades
+# above w~0.25) — the rescaled line is a function of Elo, so blending it with
+# Elo is close to a no-op. A coverage-dependent weight was fitted for exactly
+# that reason and rejected: at its best it beat the best single weight by
+# 0.0008 nats, which does not pay for making predict() coverage-aware.
+W_NO_MKT = dict(elo=0.70, form=0.30, mkt=0.0)
 # The 0.62 market weight is still a judgement call — historical closing odds do
 # not exist at any price, so it is unfittable and untouched. What HAS been
-# carried over is the elo:form ratio, which was 58:42 of the non-market weight
-# and is now the fitted 95:5 of the same 0.38. Leaving form at 42% here while
-# the measurement put it at 5% would have been believing two things at once.
-W_MKT = dict(elo=0.36, form=0.02, mkt=0.62)
+# carried over is the elo:form ratio, which is the fitted 70:30 applied to the
+# same non-market 0.38. Leaving form at 5% of it while the measurement put it
+# at 30% would have been believing two things at once.
+W_MKT = dict(elo=0.27, form=0.11, mkt=0.62)
 
 
 def load_fixtures(con, round_id):

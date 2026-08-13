@@ -40,6 +40,18 @@ What it fits
 2. W_NO_MKT, the elo/form blend weight, against a form signal REBUILT
    matchday by matchday exactly the way the live pipeline evolves it
    (Elo-seeded before MD1, then folded forward by form_update.py's rule).
+   This measures the signal the model runs on BEFORE xg_update.py has run,
+   and it is not the number to ship — see 2b.
+2b. W_NO_MKT again, this time against REAL DOMESTIC EXPECTED GOALS, which is
+   what xg_update.py writes into team_form and therefore what the model
+   actually predicts on. Stage 2's signal begins life as a restatement of Elo,
+   so asking how much it adds on top of Elo is close to a tautology; stage 2b
+   asks the question that was always the point. Three arms plus two controls:
+   xG on the matches Understat covers, xG through the deployed Elo-rescaled
+   hybrid, and the same two on plain football-data GOALS — because if goals do
+   as well, the soccerdata dependency buys nothing. Graded on points and
+   log-loss, and then on an incremental regression that can actually resolve
+   the effect, which neither of the first two can at n=378.
 3. CHASE, the second-leg tilt, on the ~44 second legs in the cache.
 4. RHO twice over: once on outcome log-loss (what the old fit optimised) and
    once on full scoreline likelihood (what the exact-score bonus is paid on).
@@ -218,7 +230,8 @@ def assemble(seasons, refresh=False):
         # The seeding snapshot is the one before the season's first kickoff —
         # the same table ingest.py would have had in front of it on draw night.
         seed_snap = snapshots[dates[0]]
-        ctx = SEASON_CTX.setdefault(season, {"elo": {}, "country": {}})
+        ctx = SEASON_CTX.setdefault(season, {"elo": {}, "country": {}, "src": {},
+                                             "seed_day": dates[0]})
         for m in matches:
             snap = snapshots[m["date"]]
             h = ingest.match_club(m["home"], snap.keys(), aliases)
@@ -231,6 +244,9 @@ def assemble(seasons, refresh=False):
                     seeded = seed_snap.get(theirs) or snap[theirs]
                     ctx["elo"][our] = seeded[0]
                     ctx["country"][our] = snap[theirs][1]
+                    # ClubElo's own spelling, kept so the domestic-form fit can
+                    # look this club up in a snapshot taken on any other date.
+                    ctx["src"][our] = theirs
             rows.append(Row(m["round"], m["home"], m["away"], m["hg"], m["ag"],
                             snap[h][0], snap[a][0], m["date"], season,
                             m["leg"], m["deficit"]))
@@ -483,6 +499,498 @@ def all_lambdas(rows, p, w_form):
         for i, lam in zip(idxs, season_lambdas([rows[i] for i in idxs], p, w_form)):
             out[i] = lam
     return out
+
+
+# ---------------------------------------------------------------------------
+# The DOMESTIC form signal — the one the model actually ships
+# ---------------------------------------------------------------------------
+# Everything above measures form as the live pipeline EVOLVES it: Elo-seeded by
+# ingest.seed_form, then folded forward by form_update.py off UCL results. That
+# measurement is honest and it answered the wrong question. A signal that begins
+# life as a restatement of Elo and is then nudged by at most eight European
+# matches cannot add much on top of Elo; the sweep it produced (form worth ~0.05
+# at best, log-loss flat then degrading) was close to tautological.
+#
+# What the model actually ships in season is xg_update.py, which OVERWRITES
+# team_form with real domestic expected goals — roughly 38 league matches a club
+# rather than eight, from a source Elo does not directly contain. That has never
+# been measured. This section measures it, and measures a control that could
+# delete the dependency outright.
+#
+# THE LEAKAGE GUARANTEE, stated plainly because the whole exercise is worthless
+# without it. Three barriers, the last two checked at runtime:
+#
+#   1. The cutoff is the matchday's EARLIEST kickoff, not each match's own date.
+#      One instant per matchday, at or before every match in it — which is also
+#      what the live pipeline looks like, since xg_update is run once before a
+#      matchday and produces one team_form snapshot for all of it.
+#   2. xg_history.Series.window() bisects the club's date-sorted history and
+#      slices STRICTLY BELOW the cutoff, then asserts its last contributing
+#      match predates the cutoff.
+#   3. domestic_field() asserts the cutoff is at or before every match it is
+#      used for, and the league weights come from the PREVIOUS domestic season
+#      only, so not even the structural constants can see the season they grade.
+import xg_history as XH
+import xg_update as XU
+
+# Windows to try. Reported side by side rather than assumed: "last 10" and
+# "season to date" are different bets about how fast a club's true level moves.
+DOM_WINDOWS = [5, 10, 20, "std"]
+# Below this many prior matches a club is treated as uncovered. An average over
+# one or two games is noise wearing a number's clothes.
+DOM_MIN_N = 3
+# model.W_MKT's market share. Unfittable here (historical closing odds do not
+# exist at any price) so it is quoted, not measured — only the elo:form ratio
+# INSIDE the remaining share is carried over from what this file fits.
+W_MKT_MKT = 0.62
+# Filled in by stage 2b so the closing "constants to ship" block can quote the
+# weight fitted against the form signal the model REALLY uses, rather than the
+# stage-2 one fitted against Elo-seeded form. Empty when --no-domestic is set.
+DOMESTIC = {}
+
+_SERIES = {}
+_FIELD = {}
+_LW = {}
+
+
+def series(source):
+    """xg_history.Series for "xg" (Understat) or "goals" (football-data)."""
+    if source not in _SERIES:
+        rows = XH.xg_series() if source == "xg" else XH.goals_series()
+        _SERIES[source] = XH.Series(rows)
+    return _SERIES[source]
+
+
+def league_weights(season, source):
+    """{country code: weight}, fitted from the PREVIOUS domestic season.
+
+    xg_update.fit_league_weights is reused rather than re-derived: it regresses
+    every big-five club's output on its Elo and asks, per league, whether that
+    league's clubs beat the pooled line — a league that flatters its clubs gets
+    discounted. Doing it per season is the point (today's numbers were fitted in
+    today's context and would be a small anachronism here), and taking the
+    season BEFORE the one being graded means the weights cannot see a single
+    match they are used to predict.
+    """
+    key = (season, source)
+    if key in _LW:
+        return _LW[key]
+    ctx = SEASON_CTX[season]
+    prev = int(season) - 1          # UCL 2024/25 <- domestic 2023/24
+    stats = {}
+    for club, games in series(source).by_club.items():
+        g = [x for x in games if XH.domestic_season(x[0]) == prev]
+        if len(g) < 10:
+            continue
+        stats[club] = (sum(x[1] for x in g) / len(g),
+                       sum(x[2] for x in g) / len(g),
+                       len(g), series(source).league.get(club, ""))
+    snap = elo_rows_on((datetime.fromisoformat(ctx["seed_day"])
+                        - timedelta(days=1)).date().isoformat())
+    _LW[key] = XU.fit_league_weights(stats, snap, ingest.load_aliases()) or {}
+    return _LW[key]
+
+
+def domestic_field(season, source, window, cutoff, hybrid):
+    """The whole field's form as of `cutoff`: (form, cw, covered).
+
+    `form` is {team: [for, against]} and `cw` {team: league weight}, both ready
+    for form_lambdas. With `hybrid` set this is the DEPLOYED shape: real numbers
+    for the clubs the source covers, and for the rest the Elo-rescaled line
+    xg_update.reseed_uncovered produces — weighted 1.0, because an Elo-derived
+    figure is already on a cross-league scale and charging it for its domestic
+    league would penalise it twice. Without `hybrid` only covered clubs exist,
+    which is the clean measurement of whether the source is informative at all.
+    """
+    key = (season, source, window, cutoff, hybrid)
+    if key in _FIELD:
+        return _FIELD[key]
+    ctx = SEASON_CTX[season]
+    teams = sorted(ctx["elo"])
+    src = series(source)
+    names = src.resolve(teams, ingest.load_aliases())
+    lw = league_weights(season, source)
+
+    form, cw, covered = {}, {}, set()
+    for t in teams:
+        w = src.window(names[t], cutoff, window, DOM_MIN_N) if names[t] else None
+        if w:
+            form[t] = [w[0], w[1]]
+            code = XH.LEAGUE_CODE.get(src.league.get(names[t], ""), "")
+            cw[t] = lw.get(code) or T.league_weight(code)
+            covered.add(t)
+
+    if hybrid:
+        # Elo as it stood the day before this matchday, not the seed-time
+        # rating: the live rescale reads whatever the nightly refresh last
+        # wrote, which is current.
+        prior = (datetime.fromisoformat(cutoff) - timedelta(days=1)).date().isoformat()
+        snap = elo_rows_on(prior)
+        elo = {t: snap[ctx["src"][t]][0] for t in teams
+               if ctx["src"].get(t) in snap} or dict(ctx["elo"])
+        derived = XU.rescale_from_elo(
+            elo, [(t, form[t][0], form[t][1]) for t in sorted(covered)],
+            [t for t in teams if t not in covered])
+        for t, f, a in derived:
+            form[t] = [f, a]
+            cw[t] = 1.0             # already cross-league; see the docstring
+    _FIELD[key] = (form, cw, covered)
+    return _FIELD[key]
+
+
+def both_covered(rows, source, window):
+    """Per row: do BOTH clubs have a real measured line from `source`?
+
+    Coverage is a property of the source and the window alone — never of the
+    blend weight or the backbone — which is what lets a sweep hold its graded
+    match set fixed across every column, and lets one arm be graded on another
+    arm's coverage so the two are compared on the same matches.
+    """
+    if not rows:
+        return []
+    season = rows[0].season
+    groups = defaultdict(list)
+    for i, r in enumerate(rows):
+        groups[(r.rid, r.leg)].append(i)
+    out = [False] * len(rows)
+    for idxs in groups.values():
+        cutoff = min(rows[i].date for i in idxs)
+        _form, _cw, covered = domestic_field(season, source, window, cutoff, False)
+        for i in idxs:
+            out[i] = rows[i].home in covered and rows[i].away in covered
+    return out
+
+
+def domestic_lambdas(rows, p, w_form, source, window, hybrid):
+    """Blended (lh, la) per row, plus per-row coverage flags.
+
+    Returns (lam, both, valid): `both` marks the rows where BOTH clubs have a
+    real measured form line, `valid` the rows that got a form blend at all.
+    Neither depends on `w_form`, so every column of a weight sweep is scored on
+    exactly the same matches.
+    """
+    if not rows:
+        return [], [], []
+    season = rows[0].season
+    neutral = {r.rid: T.get_round(r.rid).neutral for r in rows}
+    groups = defaultdict(list)
+    for i, r in enumerate(rows):
+        groups[(r.rid, r.leg)].append(i)
+
+    # `w_form` may be a single weight or a (covered, uncovered) pair. The pair
+    # is the coverage-dependent blend arm D measures: a club whose form line was
+    # rescaled from its own Elo carries no information the Elo backbone does not
+    # already have, so charging it the same weight as a club with 38 matches of
+    # measured xG is averaging a signal with a restatement.
+    w_hi, w_lo = w_form if isinstance(w_form, tuple) else (w_form, w_form)
+
+    lam = [None] * len(rows)
+    both = [False] * len(rows)
+    for idxs in groups.values():
+        # Barrier 1: one cutoff for the matchday, its earliest kickoff.
+        cutoff = min(rows[i].date for i in idxs)
+        form, cw, covered = domestic_field(season, source, window, cutoff, hybrid)
+        field = sorted(form)
+        if not field:
+            continue
+        att_mean = sum(form[t][0] * cw[t] for t in field) / len(field)
+        dfn_mean = sum(form[t][1] / cw[t] for t in field) / len(field)
+        for i in idxs:
+            r = rows[i]
+            # Barrier 3: the cutoff never postdates a match it is used for.
+            assert cutoff <= r.date, f"leak: {cutoff} cutoff on a {r.date} match"
+            le_h, le_a = lambdas(r.eh, r.ea, p, neutral[r.rid])
+            if r.home not in form or r.away not in form:
+                lam[i] = (max(le_h, 0.2), max(le_a, 0.2))
+                continue
+            lf_h, lf_a = form_lambdas(form, cw, att_mean, dfn_mean,
+                                      r.home, r.away, p, neutral[r.rid])
+            both[i] = r.home in covered and r.away in covered
+            wf = w_hi if both[i] else w_lo
+            lh = (1 - wf) * le_h + wf * lf_h
+            la = (1 - wf) * le_a + wf * lf_a
+            lh, la = leg_tilt(lh, la, r.deficit, p)
+            lam[i] = (max(lh, 0.2), max(la, 0.2))
+    # Under the hybrid every row is shippable — that is what makes arm B the
+    # number that sets the weight.
+    return lam, both, [l is not None for l in lam]
+
+
+def sweep_domestic(by_season, backbone, weights, source, window, hybrid,
+                   select="both", align=None):
+    """sweep_form's counterpart for domestic form. Same folds, same objective.
+
+    `select` picks which matches are graded: "both" (only pairs where each club
+    has a real measured line), "all" (every match, the shippable hybrid), or
+    "rest" (the complement of "both" — the matches carried by the Elo-rescaled
+    line, which is the diagnostic for whether that rescaling earns its place).
+
+    `align` names another source whose coverage is intersected in, so that two
+    arms can be graded on IDENTICAL matches. Without it the xG and goals arms
+    differ by whichever clubs one feed spells in a way ingest.match_club can
+    resolve and the other does not, and a head-to-head between them would be
+    partly a comparison of club-name spellings.
+    """
+    out = {}
+    n_graded = []
+    for w in weights:
+        folds = []
+        for fit_s, grade_s in fold_pairs(by_season):
+            p = dict(backbone[fit_s], w_form=w, league_weights=False)
+            rows = by_season[grade_s]
+            lam, both, valid = domestic_lambdas(rows, p, w, source, window, hybrid)
+            if select == "both":
+                mask = both
+            elif select == "rest":
+                mask = [v and not b for v, b in zip(valid, both)]
+            else:
+                mask = valid
+            if align:
+                mask = [m and a for m, a in
+                        zip(mask, both_covered(rows, align, window))]
+            gr = [r for r, m in zip(rows, mask) if m]
+            gl = [l for l, m in zip(lam, mask) if m]
+            if not gr:
+                continue
+            folds.append(score_rows(gr, capped(p, gr, gl), gl))
+        if not folds:
+            return {}
+        n_graded = [f["n"] for f in folds]
+        out[w] = dict(pts=sum(f["pts"] for f in folds) / len(folds),
+                      ll=sum(f["ll"] for f in folds) / len(folds),
+                      acc=sum(f["acc"] for f in folds) / len(folds),
+                      exact=sum(f["exact"] for f in folds) / len(folds),
+                      folds=folds)
+    out["n"] = n_graded
+    return out
+
+
+def ll_series(rows, p, lam):
+    """Per-match outcome log-loss, unaggregated.
+
+    log_loss() returns the mean, which is all a sweep needs. Deciding whether a
+    difference between two weights is real needs the matches themselves: the two
+    models are scored on the SAME fixtures, so the comparison is paired and the
+    match-to-match variance in difficulty — which dwarfs the effect — cancels.
+    Comparing two independent means instead would hide the signal in noise that
+    both models share.
+    """
+    out = []
+    for i, r in enumerate(rows):
+        lh, la = lam[i]
+        pw, pd, pl = probs(matrix(max(lh, 0.15), max(la, 0.15), p))
+        out.append(-log(pw if r.hg > r.ag else (pd if r.hg == r.ag else pl)))
+    return out
+
+
+def pts_series(rows, p, lam, rules=None):
+    """Per-match points earned, the objective this project is actually paid."""
+    rules = rules or S.rules_for("md1")
+    out = []
+    for i, r in enumerate(rows):
+        lh, la = lam[i]
+        m = matrix(max(lh, 0.15), max(la, 0.15), p)
+        bet = S.choose(m, rules, round_id=r.rid, leg=r.leg, deficit=r.deficit)
+        _g, earned = S.award(bet, (r.hg, r.ag), rules,
+                             round_id=r.rid, leg=r.leg, deficit=r.deficit)
+        out.append(earned)
+    return out
+
+
+def incremental_test(by_season, source, window, hybrid, select, p):
+    """Does form-implied supremacy explain goal difference BEYOND Elo's?
+
+    The paired log-loss test above compares two complete models, and most of
+    what it measures is the irreducible randomness of football — a 378-match
+    sample cannot resolve an 0.008-nat difference through all that noise. This
+    asks the narrower question directly, and with far more power: regress the
+    observed goal difference on BOTH supremacies at once,
+
+        (home goals - away goals) ~ a * elo_supremacy + b * form_supremacy
+
+    and look at b. If domestic form carries nothing Elo does not already have,
+    b is zero and its t-statistic says so. If it carries something, b is
+    positive however the downstream scoreline matrix happens to shuffle it.
+    Ordinary least squares with a two-variable normal equation, so the standard
+    error is exact rather than bootstrapped.
+    """
+    xs, es, ys = [], [], []
+    for season, rows in by_season.items():
+        lam1, both, valid = domestic_lambdas(rows, p, 1.0, source, window, hybrid)
+        lam0, _b, _v = domestic_lambdas(rows, p, 0.0, source, window, hybrid)
+        mask = both if select == "both" else valid
+        for i, r in enumerate(rows):
+            if not mask[i]:
+                continue
+            es.append(lam0[i][0] - lam0[i][1])
+            xs.append(lam1[i][0] - lam1[i][1])
+            ys.append(r.hg - r.ag)
+    n = len(ys)
+    if n < 30:
+        return None
+    # centre, then solve the 2x2 normal equations in closed form
+    me, mx, my = (sum(v) / n for v in (es, xs, ys))
+    e = [v - me for v in es]
+    x = [v - mx for v in xs]
+    y = [v - my for v in ys]
+    see = sum(v * v for v in e)
+    sxx = sum(v * v for v in x)
+    sex = sum(a * b for a, b in zip(e, x))
+    sey = sum(a * b for a, b in zip(e, y))
+    sxy = sum(a * b for a, b in zip(x, y))
+    det = see * sxx - sex * sex
+    if abs(det) < 1e-9:
+        return None
+    a_hat = (sxx * sey - sex * sxy) / det
+    b_hat = (see * sxy - sex * sey) / det
+    resid = [yy - a_hat * ee - b_hat * xx for yy, ee, xx in zip(y, e, x)]
+    s2 = sum(v * v for v in resid) / (n - 3)
+    se_b = (s2 * see / det) ** 0.5
+    # The blend weight the regression itself implies. Both regressors are a
+    # supremacy in GOALS on the same scale (each is lh - la), so a and b are
+    # directly comparable and the best linear predictor a*e + b*x renormalises
+    # to a convex blend at w = b/(a+b). This prices the weight far better than
+    # the full-model sweep can: it asks only how much of the goal difference
+    # each signal explains, instead of pushing both through a Dixon-Coles matrix
+    # and an EV-optimal bet and trying to read the answer off 34 exact scores.
+    tot = a_hat + b_hat
+    w_imp = b_hat / tot if tot > 0 else float("nan")
+    # Delta-method interval, propagating only b's uncertainty (a is estimated
+    # far more precisely; treating it as fixed is the conservative simplification
+    # because it makes the interval narrower on the side that matters least).
+    w_lo = (b_hat - 1.96 * se_b) / (a_hat + b_hat - 1.96 * se_b) if tot > 0 else 0.0
+    w_hi = (b_hat + 1.96 * se_b) / (a_hat + b_hat + 1.96 * se_b) if tot > 0 else 0.0
+    return dict(n=n, b=b_hat, se=se_b, t=b_hat / se_b if se_b else 0.0,
+                a=a_hat, corr=sex / (see * sxx) ** 0.5,
+                w=w_imp, w_lo=max(0.0, w_lo), w_hi=min(1.0, w_hi))
+
+
+def paired_ll(by_season, backbone, source, window, hybrid, select, w_a, w_b):
+    """Per-match log-loss differences (at w_b minus at w_a), pooled over folds."""
+    diffs = []
+    for fit_s, grade_s in fold_pairs(by_season):
+        rows = by_season[grade_s]
+        got = []
+        for w in (w_a, w_b):
+            p = dict(backbone[fit_s], w_form=w, league_weights=False)
+            lam, both, valid = domestic_lambdas(rows, p, w, source, window, hybrid)
+            mask = both if select == "both" else valid
+            gr = [r for r, m in zip(rows, mask) if m]
+            gl = [l for l, m in zip(lam, mask) if m]
+            got.append(ll_series(gr, capped(p, gr, gl), gl))
+        diffs += [b - a for a, b in zip(*got)]
+    return diffs
+
+
+def significance(diffs, label, trials=4000, seed=20260814):
+    """Mean paired difference with a bootstrap interval, printed and returned.
+
+    A bootstrap rather than a t-interval because per-match log-loss differences
+    are heavy-tailed — one match the model called at 3% and got wrong dominates
+    the sum — and the normal approximation is exactly what flatters a result
+    like this.
+    """
+    import random
+    n = len(diffs)
+    mean = sum(diffs) / n
+    rng = random.Random(seed)
+    boots = []
+    for _ in range(trials):
+        boots.append(sum(diffs[rng.randrange(n)] for _ in range(n)) / n)
+    boots.sort()
+    lo, hi = boots[int(0.025 * trials)], boots[int(0.975 * trials)]
+    verdict = "SIGNIFICANT" if hi < 0 else ("adverse" if lo > 0 else "not significant")
+    print(f"  {label:52} {mean:+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}]  {verdict}")
+    return dict(mean=mean, lo=lo, hi=hi, n=n, sig=hi < 0)
+
+
+def fit_split_weight(by_season, backbone, source, window, his, los):
+    """Arm D: one weight for measured-form matches, another for the rest.
+
+    Graded over EVERY match, so it is directly comparable with arm B's single
+    global weight — this is a competing way to ship the same signal, not a
+    different measurement of it. Returns {(hi, lo): metrics}.
+    """
+    out = {}
+    for hi in his:
+        for lo in los:
+            folds = []
+            for fit_s, grade_s in fold_pairs(by_season):
+                p = dict(backbone[fit_s], w_form=hi, league_weights=False)
+                rows = by_season[grade_s]
+                lam, _both, valid = domestic_lambdas(rows, p, (hi, lo),
+                                                     source, window, True)
+                gr = [r for r, m in zip(rows, valid) if m]
+                gl = [l for l, m in zip(lam, valid) if m]
+                folds.append(score_rows(gr, capped(p, gr, gl), gl))
+            out[(hi, lo)] = dict(
+                pts=sum(f["pts"] for f in folds) / len(folds),
+                ll=sum(f["ll"] for f in folds) / len(folds),
+                acc=sum(f["acc"] for f in folds) / len(folds),
+                exact=sum(f["exact"] for f in folds) / len(folds),
+                folds=folds)
+    return out
+
+
+def report_arm(by_season, backbone, weights, label, source, hybrid, note,
+               select="both", align=None):
+    """Sweep every window for one arm, print the winner's table, return it.
+
+    The window is chosen on LOG-LOSS, not on points. Points-per-match is the
+    objective this project is paid on and it is reported first everywhere, but
+    as a *selector* between near-identical candidates it is close to useless
+    here: it moves in 2-point lumps (one exact score is worth 2/n, which on a
+    both-covered arm is 0.03 pts/match), and the two seasons routinely disagree
+    by more than the whole spread of the sweep. Log-loss reads every match's
+    full distribution and produces smooth, unimodal curves. Choosing the window
+    on the noisy metric and then quoting the smooth one would be picking the
+    winner twice.
+    """
+    print(f"\n{label}\n  {note}")
+    best = None
+    summary = []
+    for window in DOM_WINDOWS:
+        sw = sweep_domestic(by_season, backbone, weights, source, window,
+                            hybrid, select, align)
+        if not sw:
+            continue
+        n = sw.pop("n")
+        w_pts = max(sw, key=lambda k: sw[k]["pts"])
+        w_ll = min(sw, key=lambda k: sw[k]["ll"])
+        summary.append((window, n, w_pts, sw[w_pts]["pts"], w_ll, sw[w_ll]["ll"],
+                        sw[0.0]["pts"], sw[0.0]["ll"]))
+        if best is None or sw[w_ll]["ll"] < best[1][best[3]]["ll"]:
+            best = (window, sw, w_pts, w_ll, n)
+    if best is None:
+        print("  no gradeable matches")
+        return None
+    print(f"  {'window':>8} {'n/fold':>8} {'w*(pts)':>8} {'pts':>8} "
+          f"{'w*(LL)':>8} {'LL':>8} {'pts@0':>8} {'LL@0':>8}")
+    for window, n, wp, pts, wl, ll, p0, l0 in summary:
+        print(f"  {str(window):>8} {'/'.join(str(x) for x in n):>8} {wp:8.2f} "
+              f"{pts:8.3f} {wl:8.2f} {ll:8.4f} {p0:8.3f} {l0:8.4f}")
+    window, sw, w_pts, w_ll, n = best
+    print(f"  best window by cross-validated log-loss: {window}")
+    graded = [g for _f, g in fold_pairs(by_season)]
+    print(f"  {'w_form':>7} {'w_elo':>6} " +
+          " ".join(f"{'pts ' + g:>9}" for g in graded) +
+          f" {'pts mean':>9} {'acc':>7} {'exact':>7} {'logloss':>9}")
+    for w in weights:
+        s = sw[w]
+        star = "  <-- best pts" if w == w_pts else ""
+        print(f"  {w:7.2f} {1-w:6.2f} " +
+              " ".join(f"{f['pts']:9.3f}" for f in s["folds"]) +
+              f" {s['pts']:9.3f} {s['acc']*100:6.1f}% "
+              f"{s['exact']*100:6.1f}% {s['ll']:9.4f}{star}")
+    swing = max(s["pts"] for s in sw.values()) - min(s["pts"] for s in sw.values())
+    d_pts = sw[w_pts]["pts"] - sw[0.0]["pts"]
+    d_ll = sw[0.0]["ll"] - sw[w_ll]["ll"]
+    print(f"  best pts at w_form={w_pts:.2f} ({d_pts:+.3f} vs w_form=0), "
+          f"best log-loss at w_form={w_ll:.2f} ({d_ll:+.4f} vs w_form=0)")
+    print(f"  swing across the sweep: {swing:.3f} pts/match; one extra exact "
+          f"score is worth {2/(sum(n)/len(n)):.3f}")
+    return dict(window=window, sweep=sw, w_pts=w_pts, w_ll=w_ll, n=n,
+                d_pts=d_pts, d_ll=d_ll, label=label)
 
 
 # ---------------------------------------------------------------------------
@@ -897,6 +1405,8 @@ def main():
                          "(double-counts; kept for comparison)")
     ap.add_argument("--fine", action="store_true",
                     help="0.02-step form sweep instead of 0.05")
+    ap.add_argument("--no-domestic", action="store_true",
+                    help="skip stage 2b (the domestic xG / goals form fit)")
     args = ap.parse_args()
     LW = args.league_weights
 
@@ -950,6 +1460,219 @@ def main():
     n_g = sum(len(by_season[g]) for g in graded) / len(graded)
     print(f"  for scale: one extra exact score anywhere in a graded season "
           f"moves pts/match by {2/n_g:.3f}\n")
+
+    # ---- stage 2b: the form signal we actually ship -----------------------
+    arms = {}
+    if not args.no_domestic:
+        print("=" * 78)
+        print("Stage 2b — DOMESTIC form, the signal xg_update.py actually ships")
+        print("Stage 2 above measures Elo-seeded form nudged by <=8 European "
+              "matches, which\nis close to asking whether Elo predicts itself. "
+              "These three arms measure real\ndomestic form — ~38 league "
+              "matches a club, from a source Elo does not contain.")
+        arms["A"] = report_arm(
+            by_season, backbone, weights,
+            "ARM A — Understat xG, BOTH clubs covered", "xg", False,
+            "is xG form informative at all? the clean measurement, small n")
+        arms["B"] = report_arm(
+            by_season, backbone, weights,
+            "ARM B — Understat xG, DEPLOYED hybrid (real xG, else Elo-rescaled)",
+            "xg", True,
+            "what we would actually ship, so this is the number that sets the "
+            "weight", select="all")
+        arms["C0"] = report_arm(
+            by_season, backbone, weights,
+            "ARM C0 — football-data GOALS, both clubs covered", "goals", False,
+            "the control, on EXACTLY arm A's matches: can plain goals replace xG?",
+            align="xg")
+        arms["C"] = report_arm(
+            by_season, backbone, weights,
+            "ARM C — football-data GOALS, hybrid", "goals", True,
+            "the control, matched to arm B — no soccerdata, no scraper, same "
+            "token", select="all")
+        arms["B-"] = report_arm(
+            by_season, backbone, weights,
+            "ARM B- — Understat xG, hybrid, only the NOT-both-covered matches",
+            "xg", True,
+            "the diagnostic: does the Elo-rescaled line carry anything, or "
+            "only dilute?", select="rest")
+        # ---- arm D: the coverage-dependent weight arm B- argues for --------
+        his = [round(i * 0.05, 2) for i in range(21)]
+        los = [round(i * 0.05, 2) for i in range(9)]
+        print("\nARM D — coverage-dependent weight, all 378 matches")
+        print("  arm B- showed the Elo-rescaled clubs carry ~nothing and hurt "
+              "above w~0.25,\n  which is why arm B's optimum sits below arm A's."
+              " So: one weight where the\n  form line is measured, another "
+              "where it was derived from Elo.")
+        # Swept over every window, because the split and the window trade off:
+        # a long window makes the measured clubs' form steadier (so it can carry
+        # a higher weight) while a short one is noisier but fresher. Fixing the
+        # window at arm A's choice would hand arm D a handicap arm B never had.
+        dgrids = {}
+        for window in DOM_WINDOWS:
+            g = fit_split_weight(by_season, backbone, "xg", window, his, los)
+            k = min(g, key=lambda k: g[k]["ll"])
+            dgrids[window] = (g, k)
+            print(f"  window {str(window):>4}: best w_hi={k[0]:.2f} / "
+                  f"w_lo={k[1]:.2f} -> LL={g[k]['ll']:.4f}, pts={g[k]['pts']:.3f}")
+        dwin = min(dgrids, key=lambda w: dgrids[w][0][dgrids[w][1]]["ll"])
+        grid = dgrids[dwin][0]
+        d_hi, d_lo = min(grid, key=lambda k: grid[k]["ll"])
+        p_hi, p_lo = max(grid, key=lambda k: grid[k]["pts"])
+        print(f"  best window for the split: {dwin}")
+        print(f"  {'w_hi / w_lo':>11} " + " ".join(f"{lo:>7.2f}" for lo in los))
+        for hi in his:
+            print(f"  {hi:10.2f} " +
+                  " ".join(f"{grid[(hi, lo)]['ll']:7.4f}" for lo in los))
+        print(f"  (cells are cross-validated outcome log-loss)")
+        print(f"  best log-loss at w_hi={d_hi:.2f} / w_lo={d_lo:.2f}: "
+              f"{grid[(d_hi, d_lo)]['ll']:.4f}, pts={grid[(d_hi, d_lo)]['pts']:.3f}")
+        print(f"  best points   at w_hi={p_hi:.2f} / w_lo={p_lo:.2f}: "
+              f"{grid[(p_hi, p_lo)]['pts']:.3f}, "
+              f"LL={grid[(p_hi, p_lo)]['ll']:.4f}")
+        # The honest comparison for arm D is not "against w_form=0" but
+        # "against the best SINGLE weight anyone could have shipped at this
+        # window" — otherwise the split gets credit for the signal itself
+        # rather than for being coverage-aware.
+        flat_sw = sweep_domestic(by_season, backbone, weights, "xg", dwin,
+                                 True, "all")
+        flat_sw.pop("n", None)
+        w_flat = min(flat_sw, key=lambda k: flat_sw[k]["ll"])
+        flat = flat_sw[w_flat]["ll"]
+        print(f"  the best FLAT weight at this window is {w_flat:.2f} "
+              f"({flat:.4f}) — the coverage split is worth "
+              f"{flat - grid[(d_hi, d_lo)]['ll']:+.4f} log-loss on top of it")
+        arms["D"] = dict(window=dwin, sweep=None, w_pts=d_hi, w_ll=d_hi,
+                         n=[len(by_season[g]) for _f, g in fold_pairs(by_season)],
+                         d_pts=0.0, d_ll=0.0, label="ARM D", grid=grid,
+                         hi=d_hi, lo=d_lo)
+
+        print("\nStage 2b summary — every arm, at its best window")
+        print(f"  {'arm':4} {'window':>7} {'n/fold':>8} {'w*':>5} {'pts@w*':>8} "
+              f"{'pts@0':>8} {'dpts':>7} {'LL@w*':>8} {'LL@0':>8} {'dLL':>8}")
+        for k in ("A", "B", "C0", "C", "B-"):
+            a = arms.get(k)
+            if not a:
+                continue
+            s = a["sweep"]
+            print(f"  {k:4} {str(a['window']):>7} "
+                  f"{'/'.join(str(x) for x in a['n']):>8} {a['w_pts']:5.2f} "
+                  f"{s[a['w_pts']]['pts']:8.3f} {s[0.0]['pts']:8.3f} "
+                  f"{a['d_pts']:+7.3f} {s[a['w_ll']]['ll']:8.4f} "
+                  f"{s[0.0]['ll']:8.4f} {-a['d_ll']:+8.4f}")
+        print("  dpts/dLL are against w_form=0 (pure Elo) on the same matches; "
+              "a negative\n  dLL is an improvement in log-loss.\n")
+
+        # ---- is any of it real? paired, per match, bootstrapped ------------
+        print("Stage 2b significance — per-match log-loss change vs w_form=0,"
+              "\n  paired on the same fixtures, 95% bootstrap interval. "
+              "Negative = better.")
+        sig = {}
+        for k, src, hyb, sel in (("A", "xg", False, "both"),
+                                 ("B", "xg", True, "all"),
+                                 ("C0", "goals", False, "both"),
+                                 ("C", "goals", True, "all")):
+            a = arms.get(k)
+            if not a:
+                continue
+            d = paired_ll(by_season, backbone, src, a["window"], hyb, sel,
+                          0.0, a["w_ll"])
+            sig[k] = significance(
+                d, f"arm {k}: w_form 0 -> {a['w_ll']:.2f} (window {a['window']}, "
+                   f"n={len(d)})")
+        # Points too — it is the objective, so a claim that raising the weight
+        # is free has to survive the same test the log-loss claim does.
+        print("  and on POINTS per match (the objective), same pairing:")
+        for k, src, hyb, sel in (("A", "xg", False, "both"), ("B", "xg", True, "all")):
+            a = arms.get(k)
+            if not a:
+                continue
+            for w in sorted({a["w_pts"], a["w_ll"]}):
+                dd = []
+                for fit_s, grade_s in fold_pairs(by_season):
+                    rows = by_season[grade_s]
+                    got = []
+                    for ww in (0.0, w):
+                        p = dict(backbone[fit_s], w_form=ww, league_weights=False)
+                        lm, bo, va = domestic_lambdas(rows, p, ww, src,
+                                                      a["window"], hyb)
+                        msk = bo if sel == "both" else va
+                        gr = [r for r, m in zip(rows, msk) if m]
+                        gl = [l for l, m in zip(lm, msk) if m]
+                        got.append(pts_series(gr, capped(p, gr, gl), gl))
+                    dd += [y - x for x, y in zip(*got)]
+                significance(dd, f"arm {k}: pts change at w_form={w:.2f} "
+                                 f"(n={len(dd)})")
+
+        # ---- the higher-powered question: any signal beyond Elo at all? ----
+        print("\n  Incremental test — does form-implied supremacy explain goal")
+        print("  difference beyond Elo's? OLS on both at once; t on the form term.")
+        print("  Every window, because this is the better-powered instrument: "
+              "the window\n  choices above were made on the metric that cannot "
+              "resolve the effect at all.")
+        print(f"  {'arm':4} {'window':>7} {'n':>5} {'b_form':>9} {'se':>7} "
+              f"{'t':>7}  {'elo/form r':>10}  {'implied w_form':>22}")
+        best_inc = {}
+        for k, src, hyb, sel in (("A", "xg", False, "both"),
+                                 ("B", "xg", True, "all"),
+                                 ("C0", "goals", False, "both"),
+                                 ("C", "goals", True, "all")):
+            if not arms.get(k):
+                continue
+            p = dict(backbone[args.seasons[0]], league_weights=False)
+            for window in DOM_WINDOWS:
+                t = incremental_test(by_season, src, window, hyb, sel, p)
+                if not t:
+                    continue
+                if k not in best_inc or abs(t["t"]) > abs(best_inc[k][1]["t"]):
+                    best_inc[k] = (window, t)
+                print(f"  {k:4} {str(window):>7} {t['n']:5} {t['b']:+9.3f} "
+                      f"{t['se']:7.3f} {t['t']:+7.2f}  {t['corr']:10.2f}  "
+                      f"{t['w']:8.2f} [{t['w_lo']:.2f},{t['w_hi']:.2f}]"
+                      f"{'  signal' if abs(t['t']) > 1.96 else ''}")
+        print("  t beyond +/-1.96 is a real increment over Elo at 95%. t is "
+              "scale-free, so it\n  is the fair xG-vs-goals comparison; the raw "
+              "b is not (the two live on\n  different scales).")
+        for k in ("A", "B", "C0", "C"):
+            if k in best_inc:
+                w, t = best_inc[k]
+                print(f"    arm {k:3} strongest at window {str(w):>4}: t={t['t']:+.2f}")
+
+        # ---- the weight to ship -------------------------------------------
+        # Window from the incremental test, weight from the full-model sweep at
+        # that window. Two instruments, each used for the question it can
+        # actually answer: the t-test can resolve "is there signal and where is
+        # it strongest" and cannot price it; the sweep prices it and cannot
+        # resolve it. Picking both from the sweep is how the old 0.05 happened.
+        rec_win = best_inc["B"][0] if "B" in best_inc else 20
+        rec_sw = sweep_domestic(by_season, backbone, weights, "xg", rec_win,
+                                True, "all")
+        rec_sw.pop("n", None)
+        w_rec = min(rec_sw, key=lambda k: rec_sw[k]["ll"])
+        print(f"\n  RECOMMENDATION — window {rec_win} (strongest incremental "
+              f"signal), then the\n  deployed hybrid's own log-loss optimum at "
+              f"that window:")
+        print(f"  {'w_form':>7} {'pts':>8} {'logloss':>9}")
+        for w in weights:
+            if w > 0.62:
+                continue
+            s = rec_sw[w]
+            star = "  <-- fitted" if w == w_rec else ""
+            print(f"  {w:7.2f} {s['pts']:8.3f} {s['ll']:9.4f}{star}")
+        r0, rw = rec_sw[0.0], rec_sw[w_rec]
+        print(f"  w_form={w_rec:.2f}: logloss {r0['ll']:.4f} -> {rw['ll']:.4f} "
+              f"({rw['ll']-r0['ll']:+.4f}), pts {r0['pts']:.3f} -> "
+              f"{rw['pts']:.3f} ({rw['pts']-r0['pts']:+.3f})")
+        nm = 1 - W_MKT_MKT
+        print(f"\n    W_NO_MKT = dict(elo={1-w_rec:.2f}, form={w_rec:.2f}, mkt=0.0)")
+        print(f"    W_MKT    = dict(elo={nm*(1-w_rec):.2f}, form={nm*w_rec:.2f}, "
+              f"mkt={W_MKT_MKT:.2f})   (same ratio inside the non-market share)")
+        print(f"    and run xg_update.py with --last {rec_win}"
+              if rec_win != "std" else
+              "    and keep xg_update.py on season-to-date (--last 0)")
+        print()
+        DOMESTIC["w"] = w_rec
+        DOMESTIC["window"] = rec_win
 
     # ---- stage 3: CHASE ---------------------------------------------------
     print("Stage 3 — CHASE, on second legs only, COUNTER_RATIO fixed at 0.45")
@@ -1023,7 +1746,34 @@ def main():
     print("Before vs after — ONE global parameter set over all "
           f"{len(allrows)} matches")
     grade_fixed(by_season, PREFIT_P, "before: pre-fit model.py")
-    grade_fixed(by_season, cur, "after:  model.py as it ships now")
+    grade_fixed(by_season, cur, "after:  model.py, ELO-SEEDED form")
+    if DOMESTIC:
+        # The line above runs model.py's shipped W_NO_MKT through the stage-2
+        # form path, and that is the WRONG PATH for it: the weight was fitted
+        # against domestic xG, and grading it against Elo-seeded form charges it
+        # for information that signal does not carry. Both rows are printed
+        # because the first is the honest answer to "what does this weight do
+        # before xg_update.py has run", which is the state the DB is in at MD1.
+        rows = [r for s in by_season for r in by_season[s]]
+        by_s = defaultdict(list)
+        for r in rows:
+            by_s[r.season].append(r)
+        lam, out = [None] * len(rows), []
+        idx = 0
+        for s in by_s:
+            l, _b, _v = domestic_lambdas(by_s[s], cur, cur["w_form"], "xg",
+                                         DOMESTIC["window"], True)
+            out += by_s[s]
+            lam[idx:idx + len(l)] = l
+            idx += len(l)
+        g = score_rows(out, cur, lam)
+        print(f"  {'after:  model.py, DOMESTIC xG form':34} "
+              f"acc={g['acc']*100:5.1f}%  exact={g['exact']*100:4.1f}%  "
+              f"pts/match={g['pts']:.3f}  logloss={g['ll']:.3f}  "
+              f"scoreLL={g['sll']:.3f}  P(0-0)={g['p00_pred']*100:.1f}%")
+        print("  the middle row is model.py's new weight applied to the form "
+              "signal it was NOT\n  fitted on; the bottom row is the one it "
+              "ships against once xg_update has run.")
     print("  (both mildly optimistic in the same way — constants were fitted "
           "on these matches)\n")
 
@@ -1059,12 +1809,30 @@ Fitted constants — copy into scripts/model.py and tournament.py:
     RHO          = {p['rho']:.2f}      (fitted on {pick} likelihood)
     draw_boost   = {p['draw_boost']:.2f}      (model_cal seed; calibrate.py re-fits in season)
     HOME_ELO     = {p['home_elo']:.0f}        (tournament.py, was a 65 guess)
-    W_NO_MKT     = dict(elo={1-w_best:.2f}, form={w_best:.2f}, mkt=0.0)
     CHASE        = {chase:.2f}      (COUNTER_RATIO held at 0.45)
 
     cross-validated: acc={after['acc']*100:.1f}%  exact={after['exact']*100:.1f}%  """
           f"""pts/match={after['pts']:.3f}
 """)
+    # W_NO_MKT is quoted from stage 2b, NOT from stage 2. Stage 2's w_best is
+    # fitted against Elo-seeded form folded forward by UCL results, which is not
+    # what the model runs on once xg_update.py has written team_form. Printing
+    # that number here as "the constant to ship" is exactly the mistake this
+    # file was extended to correct, so it is no longer printed at all.
+    if DOMESTIC:
+        w = DOMESTIC["w"]
+        nm = 1 - W_MKT_MKT
+        print(f"""    W_NO_MKT     = dict(elo={1-w:.2f}, form={w:.2f}, mkt=0.0)
+    W_MKT        = dict(elo={nm*(1-w):.2f}, form={nm*w:.2f}, mkt={W_MKT_MKT:.2f})
+                             (fitted in STAGE 2b against real domestic xG, on a
+                              {DOMESTIC['window']}-match rolling window — not against the
+                              Elo-seeded form stage 2 sweeps, which cannot
+                              measure this signal. Run xg_update.py --last """
+              f"""{DOMESTIC['window']}.)
+""")
+    else:
+        print(f"    W_NO_MKT     — not fitted, stage 2b was skipped "
+              f"(--no-domestic)\n")
 
 
 if __name__ == "__main__":

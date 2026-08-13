@@ -24,6 +24,23 @@ form signal is divided by the club's domestic-league strength weight in
 model.form_lambdas, so a 3-0 in the Eredivisie has never counted like a 3-0 in
 the Premier League.
 
+Which window, and how much it is worth
+--------------------------------------
+``--last`` defaults to 20 — a rolling window of about half a domestic season —
+because that is what the measurement prefers. scripts/backtest.py stage 2b
+rebuilt this signal historically and fitted it against the 2024/25 and 2025/26
+Champions League: a 20-match window carried the strongest increment over Elo
+(t=+4.32 on the clubs Understat covers, against +2.98 for season-to-date). Pass
+``--last 0`` for every match of the season if you want the old behaviour.
+
+The default and the recommendation are deliberately the same number. They were
+briefly not, and a default that quietly disagrees with the documented advice is
+a trap: the bare command is what gets run weekly for nine months, and it would
+have silently used the weaker signal every time.
+
+See the W_NO_MKT block in scripts/model.py for the full result, including why
+the xG here beats plain goals by enough to justify the dependency below.
+
 Coverage, honestly
 ------------------
 Understat covers the big five leagues only, so this reaches roughly 20 of the
@@ -194,10 +211,26 @@ def reseed_uncovered(con, covered, uncovered):
     So we learn the mapping from the data we do have — regress xGF and xGA on
     Elo across the covered clubs — and apply that line to the rest. Same
     ordering by strength, but on the scale the observed xG actually occupies.
+
+    The arithmetic lives in rescale_from_elo() so that scripts/backtest.py can
+    measure the hybrid signal this produces without a hand-copy of it. This
+    wrapper is unchanged in behaviour: it only supplies the Elo table.
+    """
+    if not uncovered:
+        return []
+    return rescale_from_elo(dict(con.execute("SELECT team, rating FROM elo")),
+                            covered, uncovered)
+
+
+def rescale_from_elo(elo, covered, uncovered):
+    """The pure core of reseed_uncovered: {team: rating}, covered, uncovered.
+
+    `covered` is [(team, xgf, xga)] measured from real matches, `uncovered` the
+    club names needing a derived line. Returns [(team, xgf, xga)] for whichever
+    of those have an Elo rating.
     """
     if len(covered) < 5 or not uncovered:
         return []
-    elo = dict(con.execute("SELECT team, rating FROM elo"))
     known = [(elo[t], xgf, xga) for t, xgf, xga in covered if t in elo]
     if len(known) < 5:
         return []
@@ -224,8 +257,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--seasons", nargs="+", default=["2025-2026"],
                     help="Understat season keys, e.g. 2025-2026")
-    ap.add_argument("--last", type=int, default=0,
-                    help="use only each club's last N matches (0 = all)")
+    ap.add_argument("--last", type=int, default=20,
+                    help="use only each club's last N matches (0 = all). "
+                         "20 is the fitted optimum; see the module docstring")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
