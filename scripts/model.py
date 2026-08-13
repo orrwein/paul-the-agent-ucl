@@ -37,10 +37,10 @@ MAXG = 9
 # day before kickoff. Cross-validated across the two seasons. The upstream
 # World Cup values are noted for comparison — every one of them was wrong for
 # club football, several by a lot.
-RHO = 0.24                # Dixon-Coles low-score dependence (WC build: -0.11)
+RHO = 0.21                # Dixon-Coles low-score dependence (WC build: -0.11)
 DRAW_BOOST = 1.0          # diagonal (draw) inflation, calibrated from results
 BASE_TOTAL = 3.42         # avg goals/game anchor for Elo component (was 2.65)
-ELO_TO_GOALS = 0.604      # goals of supremacy per 100 Elo (was 0.34)
+ELO_TO_GOALS = 0.600      # goals of supremacy per 100 Elo (was 0.34)
 MU = BASE_TOTAL / 2       # avg goals per team for form component (was 1.33)
 
 # On the sign of RHO: the textbook Dixon-Coles value is negative, because

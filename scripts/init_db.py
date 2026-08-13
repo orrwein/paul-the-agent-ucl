@@ -172,11 +172,12 @@ def main():
     for kind, pts in FUTURES_PTS:
         c.execute("INSERT OR REPLACE INTO futures_pts VALUES (?,?)", (kind, pts))
 
-    # Calibration seeds. goal_cal starts neutral; draw_boost starts at the
-    # value backtest.py fitted over 2024/25 + 2025/26, so a fresh season begins
-    # from measured ground rather than 1.0. calibrate.py re-fits both from
-    # actual results as the season progresses.
-    for key, seed in (("goal_cal", 1.0), ("draw_boost", 1.04)):
+    # Calibration seeds. Both start at the values backtest.py fitted over
+    # 2024/25 + 2025/26 — which for draw_boost came out at exactly 1.00 in the
+    # final likelihood fit (the earlier grid pass said 1.04; the joint refit
+    # with ELO_TO_GOALS took it back to neutral). calibrate.py re-fits both
+    # from actual results as the season progresses.
+    for key, seed in (("goal_cal", 1.0), ("draw_boost", 1.00)):
         c.execute("INSERT OR IGNORE INTO model_cal VALUES (?,?)", (key, seed))
 
     con.commit()
