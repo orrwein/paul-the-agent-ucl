@@ -1,358 +1,701 @@
-"""Export prediction data to docs/data.json for the static GitHub Pages site.
+#!/usr/bin/env python3
+"""Join the season's database into one JSON payload for the static site.
 
-Joins every locked prediction against actual match results, classifies each pick
-as exact / correct-outcome / miss, and produces a single JSON payload consumed
-by the front-end. Re-run whenever the database changes:
+    python3 scripts/export_site.py          # writes docs/data.json
 
-    python scripts/export_site.py
+Why this is a rewrite rather than an edit
+-----------------------------------------
+The World Cup version of this script read nine ``locked_bets_*`` tables, mapped
+national teams to flag emoji, and hardcoded a 32-team single-elimination tree
+with a third-place match. None of that survives the move to club football: one
+``locked_bets`` table keyed by round, clubs instead of countries, one 36-team
+league table instead of twelve groups, and knockout ties played over two legs.
+
+What the front-end needs, and does not get anywhere else
+--------------------------------------------------------
+This is the only place the pieces are joined. The database stores predictions
+and results in separate tables and never grades anything; the *grade* — exact /
+right-direction / miss, and the points it earned — is computed here, once, so
+the browser only has to draw it.
+
+Three things are derived rather than read, because nothing in the pipeline
+writes them (see REPORT notes at the bottom of the module docstring):
+
+* the live league table, ordered by UEFA's tiebreakers, from ``match_results``;
+* two-legged ties and their running aggregates, from ``fixtures`` + results —
+  ``ties`` is created but its aggregate columns are never populated;
+* which clubs are eliminated, which the top-scorer projection needs.
+
+On showing points
+-----------------
+The internal points game stays out of the public dashboard (README, "Internal
+scoring"), so the payload marks it ``scoring.public = false`` and the site keeps
+it behind an explicit opt-in toggle. The numbers are still exported, because
+hiding them in the *data* would make the scorecard unauditable.
+
+No external assets
+------------------
+Clubs have no flag emoji, so each club gets a monogram badge: initials derived
+from its name plus a hue derived from a stable hash of it. Both are computed
+here so the site never has to fetch an image or agree with the exporter about
+how a name shortens.
 """
 import json
 import os
+import re
 import sqlite3
+import zlib
 from datetime import datetime, timezone
 
 from paths import DB, TOURNAMENT
+import tournament as T
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(BASE, "docs", "data.json")
 
-# Team -> ISO 3166-1 alpha-2 (for regional-indicator flag emoji). England and
-# Scotland use their subdivision flags handled separately below.
-ISO = {
-    "Algeria": "DZ", "Argentina": "AR", "Australia": "AU", "Austria": "AT",
-    "Belgium": "BE", "Bosnia and Herzegovina": "BA", "Brazil": "BR",
-    "Canada": "CA", "Cape Verde": "CV", "Colombia": "CO", "Croatia": "HR",
-    "Curacao": "CW", "Czechia": "CZ", "DR Congo": "CD", "Ecuador": "EC",
-    "Egypt": "EG", "France": "FR", "Germany": "DE", "Ghana": "GH",
-    "Haiti": "HT", "Iran": "IR", "Iraq": "IQ", "Ivory Coast": "CI",
-    "Japan": "JP", "Jordan": "JO", "Mexico": "MX", "Morocco": "MA",
-    "Netherlands": "NL", "New Zealand": "NZ", "Norway": "NO", "Panama": "PA",
-    "Paraguay": "PY", "Portugal": "PT", "Qatar": "QA", "Saudi Arabia": "SA",
-    "Senegal": "SN", "South Africa": "ZA", "South Korea": "KR", "Spain": "ES",
-    "Sweden": "SE", "Switzerland": "CH", "Tunisia": "TN", "Turkiye": "TR",
-    "USA": "US", "Uruguay": "UY", "Uzbekistan": "UZ",
+# The league-phase draw. Before it happens there are no clubs and no fixtures,
+# and the site has to say so rather than render 36 empty rows.
+DRAW_DATE = os.environ.get("PAUL_DRAW_DATE", "2026-08-27")
+DRAW_LABEL = os.environ.get("PAUL_DRAW_LABEL", "27 August 2026")
+
+# How many simulations sim_results was built from. simulate.py's own default;
+# only used to label the title-race section honestly.
+SIM_COUNT = int(os.environ.get("PAUL_SIMS", 20000))
+
+
+# ---------------------------------------------------------------------------
+# Club identity without images
+# ---------------------------------------------------------------------------
+# Legal-form tokens that carry no identity. Deliberately conservative: "PSV"
+# and "AZ" ARE the club's name, so they are not in here, and anything that
+# would strip a name down to nothing falls back to the full token list.
+_GENERIC = {
+    "fc", "cf", "afc", "sc", "sk", "fk", "ac", "bc", "kv", "as", "ss", "ssc",
+    "cd", "us", "sv", "bv", "nk", "hnk", "gnk", "cfr", "sad", "club", "calcio",
+    "1899", "1900", "1904", "1907", "04", "05", "09", "1.",
 }
-_SUBDIVISION = {
-    # England / Scotland: tag-sequence emoji flags
-    "England": "\U0001F3F4\U000E0067\U000E0062\U000E0065\U000E006E\U000E0067\U000E007F",
-    "Scotland": "\U0001F3F4\U000E0067\U000E0062\U000E0073\U000E0063\U000E0074\U000E007F",
-}
+# Connectives, kept out of initials so "Club Atlético de Madrid" reads AM.
+_CONNECTIVE = {"de", "del", "di", "du", "da", "van", "von", "of", "the", "und",
+               "y", "e", "i", "la", "le", "el"}
+
+# A curated hue ring rather than the full 360°, so no badge lands on a muddy
+# olive that fights the turf-green page. Fifteen is enough that collisions
+# inside one 36-club field are rare and harmless.
+_HUES = [8, 26, 44, 62, 96, 132, 158, 176, 196, 214, 236, 262, 288, 318, 338]
 
 
-def flag(team):
-    if team in _SUBDIVISION:
-        return _SUBDIVISION[team]
-    iso = ISO.get(team)
-    if not iso:
-        return "\U0001F3F3"  # white flag fallback
-    return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in iso)
+def _tokens(name):
+    parts = [p for p in re.split(r"[\s/\-–_.]+", name) if p]
+    keep = [p for p in parts
+            if p.lower() not in _GENERIC and p.lower() not in _CONNECTIVE]
+    return keep or [p for p in parts if p.lower() not in _CONNECTIVE] or parts
 
 
+def initials(name):
+    """Two or three letters that read as the club. No image, no lookup table."""
+    toks = _tokens(name)
+    if len(toks) == 1:
+        letters = [c for c in toks[0] if c.isalpha()][:3]
+        return "".join(letters).upper() or "?"
+    return "".join(t[0] for t in toks[:3]).upper()
+
+
+def badge(name):
+    """Monogram badge: initials plus a stable hue. crc32, not hash(), because
+    Python randomises string hashing per process and the colours must not
+    change between two runs of the exporter."""
+    h = _HUES[zlib.crc32(name.encode("utf-8")) % len(_HUES)]
+    return {"txt": initials(name), "hue": h}
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
 def direction(hg, ag):
-    if hg > ag:
-        return "H"
-    if hg < ag:
-        return "A"
-    return "D"
+    if hg is None or ag is None:
+        return None
+    return "H" if hg > ag else ("A" if hg < ag else "D")
 
 
-# Elo-based strength tiers (eloratings.net scale). Thresholds tuned to the
-# 48-team field so each band is meaningful.
-TIERS = [
-    (2020, "elite", "Elite"),
-    (1920, "contender", "Contender"),
-    (1830, "darkhorse", "Dark Horse"),
-    (1740, "challenger", "Challenger"),
-    (0, "underdog", "Underdog"),
-]
+def _round_meta():
+    return {r.id: r for r in T.ROUNDS}
 
 
-def load_elo(con):
-    return {t: r for t, r in con.execute("SELECT team, rating FROM elo")}
+def _rows(con, sql, params=()):
+    return con.execute(sql, params).fetchall()
 
 
-def tier_for(elo):
-    if elo is None:
-        return {"key": "unknown", "label": "—", "elo": None}
-    for cut, key, label in TIERS:
-        if elo >= cut:
-            return {"key": key, "label": label, "elo": round(elo)}
-    return {"key": "underdog", "label": "Underdog", "elo": round(elo)}
+def _has_rows(con, table):
+    try:
+        return con.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+    except sqlite3.Error:
+        return False
 
 
-def load_conf(con):
-    """Map (home, away) -> model win probability for the picked winner."""
-    conf = {}
-    for table in ("locked_bets_md2", "locked_bets_md3",
-                  "locked_bets_r32", "locked_bets_r16", "locked_bets_qf",
-                  "locked_bets_sf", "locked_bets_final", "locked_bets_third"):
-        for home, away, c in con.execute(
-                f"SELECT home, away, conf FROM {table}"):
-            if c is not None:
-                conf[(home, away)] = round(c, 4)
-    return conf
+# ---------------------------------------------------------------------------
+# Loaders
+# ---------------------------------------------------------------------------
+def load_teams(con):
+    """Club metadata, keyed by name — the one place the site looks up a badge,
+    a league code or an Elo rating, so no other list has to repeat them."""
+    elo = dict(_rows(con, "SELECT team, rating FROM elo"))
+    elo_base = dict(_rows(con, "SELECT team, rating FROM elo_base"))
+    form = {t: (gf, ga) for t, gf, ga in
+            _rows(con, "SELECT team, gf, ga FROM team_form")}
+    sims = {t: (ti, fi, se, t8, ko) for t, ti, fi, se, t8, ko in _rows(
+        con, "SELECT team, title, final, semi, top8, ko FROM sim_results")}
+
+    out = {}
+    for name, pot, league, coef in _rows(
+            con, "SELECT name, pot, league, coefficient FROM teams ORDER BY name"):
+        gf, ga = form.get(name, (None, None))
+        e, e0 = elo.get(name), elo_base.get(name)
+        out[name] = {
+            "league": league,
+            "pot": pot,
+            "coef": coef,
+            "badge": badge(name),
+            "elo": round(e) if e is not None else None,
+            "elo_drift": round(e - e0) if (e is not None and e0 is not None) else None,
+            "form_gf": round(gf, 2) if gf is not None else None,
+            "form_ga": round(ga, 2) if ga is not None else None,
+            "sim": ({"title": sims[name][0], "final": sims[name][1],
+                     "semi": sims[name][2], "top8": sims[name][3],
+                     "ko": sims[name][4]} if name in sims else None),
+        }
+    return out
 
 
 def load_scoring(con):
-    rows = con.execute("SELECT stage, dir_pts, exact_pts FROM scoring").fetchall()
-    return {s: (d, e) for s, d, e in rows}
+    return {r: (d, e) for r, d, e in
+            _rows(con, "SELECT round, dir_pts, exact_pts FROM scoring")}
 
 
-KNOCKOUT_STAGES = {"r32", "r16", "qf", "sf", "final", "third"}
+def load_fixtures(con):
+    """(round, home, away) -> {leg, kickoff}, plus per-round ordered lists."""
+    fx = {}
+    for fid, rid, leg, ko, h, a in _rows(
+            con, "SELECT id, round, leg, kickoff, home, away FROM fixtures "
+                 "ORDER BY round, COALESCE(kickoff,''), id"):
+        fx[(rid, h, a)] = {"id": fid, "leg": leg or 1, "kickoff": ko,
+                           "home": h, "away": a, "round": rid}
+    return fx
 
 
 def load_results(con):
-    """Map (home, away) -> (hg, ag, matchday, pen_home, pen_away)."""
-    cols = {c[1] for c in con.execute("PRAGMA table_info(match_results)")}
-    pen = ", pen_home, pen_away" if {"pen_home", "pen_away"} <= cols else ""
-    res = {}
-    for row in con.execute(f"SELECT home, away, hg, ag, matchday{pen} FROM match_results"):
-        home, away, hg, ag, md = row[:5]
-        ph, pa = (row[5], row[6]) if pen else (None, None)
-        res[(home, away)] = (hg, ag, md, ph, pa)
-    return res
+    return {(rid, h, a): (hg, ag, ph, pa) for h, a, hg, ag, rid, ph, pa in _rows(
+        con, "SELECT home, away, hg, ag, round, pen_home, pen_away "
+             "FROM match_results")}
 
 
-def advance_dir(stage, hg, ag, ph, pa):
-    """Directional outcome. For a knockout tie level after 120', the team that
-    wins the penalty shootout is treated as the winner (they advance)."""
-    if hg != ag:
-        return direction(hg, ag)
-    if stage in KNOCKOUT_STAGES and ph is not None and pa is not None:
-        return "H" if ph > pa else "A"
-    return "D"
+def load_picks(con):
+    return {(rid, h, a): {"ph": ph, "pa": pa, "winner": w, "conf": conf,
+                          "used_mkt": bool(mkt), "provisional": bool(prov),
+                          "locked_at": at}
+            for rid, h, a, _leg, ph, pa, w, conf, mkt, prov, at in _rows(
+                con, "SELECT round, home, away, leg, ph, pa, winner, conf, "
+                     "used_mkt, provisional, locked_at FROM locked_bets")}
 
 
-# Each source: table, columns for predicted (home, away, ph, pa), stage key, round label
-SOURCES = [
-    ("locked_bets", "home, away, ph, pa", "group", "Group · MD1"),
-    ("locked_bets_md2", "home, away, hg, ag", "group", "Group · MD2"),
-    ("locked_bets_md3", "home, away, hg, ag", "group", "Group · MD3"),
-    ("locked_bets_r32", "home, away, hg, ag", "r32", "Round of 32"),
-    ("locked_bets_r16", "home, away, hg, ag", "r16", "Round of 16"),
-    ("locked_bets_qf", "home, away, hg, ag", "qf", "Quarter-finals"),
-    ("locked_bets_sf", "home, away, hg, ag", "sf", "Semi-finals"),
-    ("locked_bets_final", "home, away, hg, ag", "final", "Final"),
-    ("locked_bets_third", "home, away, hg, ag", "third", "Third-place"),
-]
+# ---------------------------------------------------------------------------
+# League table
+# ---------------------------------------------------------------------------
+def build_table(con, teams, results):
+    """The live 36-club table, ordered by UEFA's league-phase tiebreakers.
+
+    simulate.run_league sorts by points, goal difference, goals for, away goals
+    and wins, then breaks what is left at random the way the regulations fall
+    back to drawing lots. A website cannot flicker between refreshes, so the
+    final tiebreak here is the simulator's own top-8 probability (and then the
+    club name): deterministic, and before a ball is kicked it orders 36 clubs
+    on zero points by how good the model thinks they are rather than
+    alphabetically, which reads as an accident.
+    """
+    stat = {t: dict(p=0, w=0, d=0, l=0, gf=0, ga=0, away_gf=0) for t in teams}
+    for (rid, h, a), (hg, ag, _ph, _pa) in results.items():
+        if not rid or not rid.startswith("md"):
+            continue
+        if h not in stat or a not in stat:
+            continue
+        sh, sa = stat[h], stat[a]
+        sh["p"] += 1; sa["p"] += 1
+        sh["gf"] += hg; sh["ga"] += ag
+        sa["gf"] += ag; sa["ga"] += hg
+        sa["away_gf"] += ag
+        if hg > ag:
+            sh["w"] += 1; sa["l"] += 1
+        elif ag > hg:
+            sa["w"] += 1; sh["l"] += 1
+        else:
+            sh["d"] += 1; sa["d"] += 1
+
+    def pts(s):
+        return s["w"] * 3 + s["d"]
+
+    def sim_top8(t):
+        sim = teams[t].get("sim")
+        return sim["top8"] if sim else 0.0
+
+    order = sorted(
+        stat,
+        key=lambda t: (-pts(stat[t]),
+                       -(stat[t]["gf"] - stat[t]["ga"]),
+                       -stat[t]["gf"],
+                       -stat[t]["away_gf"],
+                       -stat[t]["w"],
+                       -sim_top8(t),
+                       t))
+
+    rows = []
+    for i, t in enumerate(order, start=1):
+        s = stat[t]
+        rows.append({
+            "rank": i, "team": t,
+            "p": s["p"], "w": s["w"], "d": s["d"], "l": s["l"],
+            "gf": s["gf"], "ga": s["ga"], "gd": s["gf"] - s["ga"],
+            "pts": pts(s), "away_gf": s["away_gf"],
+            "band": T.outcome_for_rank(i) or "out",
+        })
+    return rows
 
 
-def build_predictions(con, scoring, results, elo, conf):
+def build_cutlines():
+    return [{"from": lo, "to": hi, "band": rid or "out", "label": label}
+            for (lo, hi), rid, label in T.CUTLINES]
+
+
+# ---------------------------------------------------------------------------
+# Picks, grading and points
+# ---------------------------------------------------------------------------
+def grade(pick, result, dir_pts, exact_pts):
+    """exact / dir / miss, and the points it actually earned.
+
+    A knockout leg is graded as the 90 minutes it was — a shootout decides who
+    goes through, not what the score was, so it never turns a predicted draw
+    into a predicted win. The tie's own outcome is graded separately, by the
+    aggregate, in build_ties.
+    """
+    hg, ag = result[0], result[1]
+    if pick["ph"] is None or pick["pa"] is None:
+        return None, 0
+    if pick["ph"] == hg and pick["pa"] == ag:
+        return "exact", exact_pts
+    if direction(pick["ph"], pick["pa"]) == direction(hg, ag):
+        return "dir", dir_pts
+    return "miss", 0
+
+
+def build_rounds(con, fixtures, picks, results, scoring):
+    """One entry per round, in competition order, each carrying its fixtures.
+
+    Rounds with nothing in them yet are still emitted: the site draws the whole
+    thirteen-round spine from md1 to the final from day one, so a visitor can
+    see the shape of the season before any of it exists.
+    """
     out = []
-    for table, cols, stage, label in SOURCES:
-        dir_pts, exact_pts = scoring.get(stage, (1, 3))
-        for home, away, ph, pa in con.execute(f"SELECT {cols} FROM {table}"):
-            pred_dir = direction(ph, pa)
-            win_prob = conf.get((home, away))
+    for rnd in T.ROUNDS:
+        dir_pts, exact_pts = scoring.get(rnd.id, (1, 3))
+        keys = [k for k in fixtures if k[0] == rnd.id]
+        # Anything picked or played without a fixture row still has to show up.
+        keys += [k for k in picks if k[0] == rnd.id and k not in fixtures]
+        keys += [k for k in results if k[0] == rnd.id and k not in fixtures
+                 and k not in picks]
+        seen, ordered = set(), []
+        for k in keys:
+            if k not in seen:
+                seen.add(k)
+                ordered.append(k)
+        ordered.sort(key=lambda k: (fixtures.get(k, {}).get("kickoff") or "~",
+                                    fixtures.get(k, {}).get("id", 1 << 30), k[1]))
+
+        matches, tally = [], dict(graded=0, exact=0, dir=0, miss=0, pts=0, max_pts=0)
+        for key in ordered:
+            _rid, home, away = key
+            fx = fixtures.get(key, {})
+            pick = picks.get(key)
+            res = results.get(key)
             row = {
-                "round": label,
-                "stage": stage,
-                "home": home,
-                "away": away,
-                "home_flag": flag(home),
-                "away_flag": flag(away),
-                "home_tier": tier_for(elo.get(home)),
-                "away_tier": tier_for(elo.get(away)),
-                "pred_home": ph,
-                "pred_away": pa,
-                "pred_dir": pred_dir,
-                "confidence": win_prob,
+                "home": home, "away": away,
+                "leg": fx.get("leg", 1),
+                "kickoff": fx.get("kickoff"),
             }
-            actual = results.get((home, away))
-            if actual is None:
-                # try reversed fixture orientation
-                rev = results.get((away, home))
-                if rev is not None:
-                    ag, hg, md, pa, ph_pen = rev
-                    actual = (hg, ag, md, ph_pen, pa)
-            if actual is None:
-                row.update({"status": "pending",
-                            "actual_home": None, "actual_away": None, "hit": None})
+            if pick:
+                row.update({"ph": pick["ph"], "pa": pick["pa"],
+                            "winner": pick["winner"],
+                            "conf": round(pick["conf"], 4) if pick["conf"] else None,
+                            "mkt": pick["used_mkt"],
+                            "provisional": pick["provisional"],
+                            "locked_at": pick["locked_at"]})
+            if res:
+                row.update({"hg": res[0], "ag": res[1]})
+                if res[2] is not None and res[3] is not None:
+                    row["pens"] = [res[2], res[3]]
+
+            if res and pick:
+                g, p = grade(pick, res, dir_pts, exact_pts)
+                row["grade"], row["pts"] = g, p
+                row["status"] = "graded"
+                tally["graded"] += 1
+                tally[g] += 1
+                tally["pts"] += p
+                tally["max_pts"] += exact_pts
+            elif res:
+                row["status"] = "played"          # result in, never picked
+            elif pick:
+                row["status"] = "locked"          # pick in, not played
             else:
-                hg, ag, _md, pen_h, pen_a = actual
-                exact = (ph == hg and pa == ag)
-                actual_dir = advance_dir(stage, hg, ag, pen_h, pen_a)
-                dir_ok = pred_dir == actual_dir
-                shootout = (hg == ag and pen_h is not None and pen_a is not None
-                            and stage in KNOCKOUT_STAGES)
-                row.update({
-                    "status": "played",
-                    "actual_home": hg,
-                    "actual_away": ag,
-                    "actual_dir": actual_dir,
-                    "pen_home": pen_h if shootout else None,
-                    "pen_away": pen_a if shootout else None,
-                    "pen_winner": (home if pen_h > pen_a else away) if shootout else None,
-                    "hit": "exact" if exact else ("dir" if dir_ok else "miss"),
-                })
-            out.append(row)
+                row["status"] = "scheduled"       # fixture known, no pick yet
+            matches.append(row)
+
+        out.append({
+            "id": rnd.id, "label": rnd.label, "phase": rnd.phase,
+            "legs": rnd.legs, "neutral": rnd.neutral,
+            "dir_pts": dir_pts, "exact_pts": exact_pts,
+            "matches": matches,
+            "n": len(matches),
+            "locked": sum(1 for m in matches if m.get("ph") is not None),
+            "played": sum(1 for m in matches if "hg" in m),
+            **tally,
+            "accuracy": (round((tally["exact"] + tally["dir"]) / tally["graded"], 4)
+                         if tally["graded"] else None),
+            "exact_rate": (round(tally["exact"] / tally["graded"], 4)
+                           if tally["graded"] else None),
+        })
     return out
 
 
-def build_futures(con, gb_pick=None, gb_final=False):
-    out = []
-    picks = dict(con.execute("SELECT bet, pick FROM locked_futures"))
-    labels = {"champion": "Champion", "golden_boot": "Golden Boot"}
+# ---------------------------------------------------------------------------
+# Two-legged ties
+# ---------------------------------------------------------------------------
+def build_ties(con, fixtures, picks, results, scoring):
+    """Reconstruct each knockout tie from its two legs.
 
-    # Current model-favourite for each market.
-    champ_row = con.execute(
-        "SELECT team FROM sim_results ORDER BY title DESC LIMIT 1").fetchone()
-    # The champion market is only truly settled once the Final has been played;
-    # golden_boot is settled once nobody's tournament run is still ongoing.
-    champion_decided = con.execute(
-        "SELECT 1 FROM match_results WHERE matchday = 8 LIMIT 1").fetchone() is not None
-    decided = {"champion": champion_decided, "golden_boot": gb_final}
-    current = {
-        "champion": champ_row[0] if champ_row else None,
-        "golden_boot": gb_pick,
+    ``ties`` exists in the schema but nothing fills in agg_a/agg_b/pen_*/winner
+    — scripts/round.py only ever INSERT OR IGNOREs the pairing, and does it once
+    per fixture, so both orientations of the same tie end up as separate rows.
+    Deriving the tie from the fixture list instead is both correct and
+    self-healing, and the DB is consulted only for the seed's identity.
+
+    The seed (better league finish) hosts the SECOND leg — UEFA's rule and the
+    one the simulator models — so leg 2's home side is who the tie belongs to.
+    """
+    ties = []
+    for rnd in T.KNOCKOUT_ROUNDS:
+        if rnd.legs != 2:
+            continue
+        dir_pts, exact_pts = scoring.get(rnd.id, (2, 5))
+        legs_by_pair = {}
+        for (rid, h, a), fx in fixtures.items():
+            if rid != rnd.id:
+                continue
+            legs_by_pair.setdefault(frozenset((h, a)), []).append(fx)
+
+        for pair, legs in sorted(
+                legs_by_pair.items(),
+                key=lambda kv: min(f.get("kickoff") or "~" for f in kv[1])):
+            legs.sort(key=lambda f: (f["leg"], f.get("kickoff") or "~", f["id"]))
+            second = next((f for f in legs if f["leg"] == 2), legs[-1])
+            seed = second["home"]
+            other = next(iter(pair - {seed})) if len(pair) == 2 else second["away"]
+
+            agg = {seed: 0, other: 0}
+            pens, played = None, 0
+            leg_rows = []
+            for f in legs:
+                key = (rnd.id, f["home"], f["away"])
+                pick, res = picks.get(key), results.get(key)
+                row = {"leg": f["leg"], "home": f["home"], "away": f["away"],
+                       "kickoff": f.get("kickoff")}
+                if pick:
+                    row.update({"ph": pick["ph"], "pa": pick["pa"],
+                                "conf": round(pick["conf"], 4) if pick["conf"] else None})
+                if res:
+                    hg, ag, ph, pa = res
+                    row.update({"hg": hg, "ag": ag})
+                    agg[f["home"]] += hg
+                    agg[f["away"]] += ag
+                    played += 1
+                    if ph is not None and pa is not None:
+                        pens = ([ph, pa] if f["home"] == seed else [pa, ph])
+                        row["pens"] = [ph, pa]
+                    if pick:
+                        row["grade"], row["pts"] = grade(pick, res, dir_pts, exact_pts)
+                leg_rows.append(row)
+
+            winner = None
+            level = played == 2 and agg[seed] == agg[other]
+            if played == len(legs) and played == 2:
+                if not level:
+                    winner = seed if agg[seed] > agg[other] else other
+                elif pens:
+                    winner = seed if pens[0] > pens[1] else other
+            # A shootout only decides a tie that is actually level after 180'.
+            # A stray pen column on a decided tie is data noise, not a result.
+            if not level:
+                pens = None
+
+            # Our own call on the tie: the aggregate of the two locked legs.
+            pred_seed = sum(r.get("ph", 0) if r["home"] == seed else r.get("pa", 0)
+                            for r in leg_rows)
+            pred_other = sum(r.get("ph", 0) if r["home"] == other else r.get("pa", 0)
+                             for r in leg_rows)
+            fully_locked = all(r.get("ph") is not None for r in leg_rows)
+            pred_winner = None
+            if fully_locked and pred_seed != pred_other:
+                pred_winner = seed if pred_seed > pred_other else other
+
+            ties.append({
+                "round": rnd.id, "label": rnd.label,
+                "seed": seed, "other": other,
+                "legs": leg_rows,
+                "agg_seed": agg[seed] if played else None,
+                "agg_other": agg[other] if played else None,
+                "pens": pens,
+                "winner": winner,
+                "pred_agg_seed": pred_seed if fully_locked else None,
+                "pred_agg_other": pred_other if fully_locked else None,
+                "pred_winner": pred_winner,
+                "tie_grade": (None if not winner or not pred_winner
+                              else ("hit" if winner == pred_winner else "miss")),
+                "status": ("done" if winner else
+                           "live" if played else
+                           "locked" if fully_locked else "scheduled"),
+            })
+    return ties
+
+
+# ---------------------------------------------------------------------------
+# Bracket
+# ---------------------------------------------------------------------------
+def build_bracket(table, ties, rounds, results):
+    """The knockout tree, drawable before the knockout draw exists.
+
+    Every pairing in this competition is fixed by league position — only the
+    slot inside each band is drawn — so the bracket is meaningful the moment the
+    league table has any shape at all. Before the draw we emit the bands with
+    their position ranges and, if the table is live, the clubs currently sitting
+    in them, flagged ``provisional``. Once real ties appear they replace the
+    projection for that round.
+    """
+    by_rank = {r["rank"]: r["team"] for r in table}
+    live = any(r["p"] for r in table)
+    final_table = bool(table) and all(r["p"] >= T.MATCHES_EACH for r in table)
+
+    def occupants(lo, hi):
+        return [by_rank.get(i) for i in range(lo, hi + 1)]
+
+    ties_by_round = {}
+    for t in ties:
+        ties_by_round.setdefault(t["round"], []).append(t)
+
+    bands = {
+        "ko_po": [{"code": code, "seeds": list(s), "unseeded": list(u),
+                   "seed_teams": occupants(*s), "unseeded_teams": occupants(*u),
+                   "note": f"{s[0]}/{s[1]} v {u[0]}/{u[1]}"}
+                  for code, s, u in T.PLAYOFF_BANDS],
+        "r16": [{"code": code, "seeds": list(s), "feeder": feeder,
+                 "seed_teams": occupants(*s),
+                 "note": f"{s[0]}/{s[1]} v winners of play-off {feeder}"}
+                for code, s, feeder in T.R16_BANDS],
+        "qf": [{"code": f"{a}/{b}", "note": f"round-of-16 band {a} v band {b}"}
+               for a, b in T.QF_BANDS],
+        "sf": [{"code": "—", "note": "the two quarter-final winners in each half"}],
+        "final": [{"code": "—", "note": "one match, neutral venue"}],
     }
 
-    for kind, pick in picks.items():
-        cur = current.get(kind)
-        is_player = kind == "golden_boot"
-        is_decided = decided.get(kind, False)
-        status = ("won" if cur == pick else "lost") if is_decided else "pending"
+    out = []
+    for rnd in T.KNOCKOUT_ROUNDS:
+        rt = ties_by_round.get(rnd.id, [])
+        final_match = None
+        if rnd.id == "final":
+            fr = next((r for r in rounds if r["id"] == "final"), None)
+            final_match = (fr["matches"][0] if fr and fr["matches"] else None)
         out.append({
-            "kind": kind,
-            "label": labels.get(kind, kind.title()),
-            "pick": pick,
-            "flag": flag_for_player(con, pick) if is_player else flag(pick.split(" ")[-1]),
-            "current": cur,
-            "current_flag": (flag_for_player(con, cur) if is_player else flag(cur.split(" ")[-1])) if cur else "",
-            "holding": (cur == pick),
-            "status": status,
+            "id": rnd.id, "label": rnd.label, "legs": rnd.legs,
+            "neutral": rnd.neutral,
+            "ties": rt,
+            "match": final_match,
+            "bands": bands.get(rnd.id, []),
+            "drawn": bool(rt or final_match),
+            # A projection is only worth showing once results exist; before
+            # then the band ranges alone are the honest answer.
+            "projected": bool(live and not rt and not final_match),
+            "settled": final_table,
         })
     return out
 
 
-def load_alive(con):
-    """Teams still alive right now, for Golden Boot purposes: the 16
-    Round-of-16 participants, minus anyone whose tournament run is truly
-    over. R32/R16/QF losers are out immediately (single elimination), but a
-    semi-final loser still has the third-place match to play, so they stay
-    "alive" (able to add goals) until that match is recorded — likewise a
-    finalist stays alive through the Final itself. Re-derived every run so
-    it never goes stale mid-round."""
-    teams = {t for (t,) in con.execute(
-        "SELECT home FROM locked_bets_r16 UNION SELECT away FROM locked_bets_r16")}
-    cols = {c[1] for c in con.execute("PRAGMA table_info(match_results)")}
-    pen = ", pen_home, pen_away" if {"pen_home", "pen_away"} <= cols else ""
-    for row in con.execute(f"SELECT home, away, hg, ag, matchday{pen} FROM match_results "
-                            f"WHERE matchday >= 5"):
-        home, away, hg, ag, md = row[0], row[1], row[2], row[3], row[4]
-        ph, pa = (row[5], row[6]) if pen else (None, None)
-        if hg > ag:
-            winner, loser = home, away
-        elif hg < ag:
-            winner, loser = away, home
-        elif ph is not None and pa is not None:
-            winner, loser = (home, away) if ph > pa else (away, home)
-        else:
-            continue  # level with no shootout on record — not actually decided
-        if md == 7:
-            continue  # SF: winner -> Final, loser -> third-place -- both still play on
-        if md in (8, 9):
-            # Final / third-place match: both participants' tournament ends here.
-            teams.discard(winner)
-            teams.discard(loser)
-        else:
-            teams.discard(loser)
-    return teams
+# ---------------------------------------------------------------------------
+# Season state
+# ---------------------------------------------------------------------------
+def season_state(teams, rounds, table, ties):
+    league = [r for r in rounds if r["phase"] == "league"]
+    league_played = sum(r["played"] for r in league)
+    ko_played = sum(r["played"] for r in rounds if r["phase"] == "knockout")
+    final_round = next(r for r in rounds if r["id"] == "final")
+    champion = None
+    if final_round["matches"]:
+        m = final_round["matches"][0]
+        if "hg" in m:
+            if m["hg"] != m["ag"]:
+                champion = m["home"] if m["hg"] > m["ag"] else m["away"]
+            elif m.get("pens"):
+                champion = m["home"] if m["pens"][0] > m["pens"][1] else m["away"]
+
+    if not teams:
+        phase = "pre_draw"
+    elif champion:
+        phase = "complete"
+    elif league_played >= T.N_FIXTURES:
+        phase = "knockout"
+    elif league_played:
+        phase = "league"
+    else:
+        phase = "pre_season"
+
+    current = None
+    for r in rounds:
+        if r["n"] and r["played"] < r["n"]:
+            current = r["id"]
+            break
+
+    return {
+        "phase": phase,
+        "draw_date": DRAW_DATE,
+        "draw_label": DRAW_LABEL,
+        "teams_known": len(teams),
+        "teams_expected": T.N_TEAMS,
+        "league_played": league_played,
+        "league_total": T.N_FIXTURES,
+        "knockout_played": ko_played,
+        "current_round": current,
+        "champion": champion,
+        "table_live": any(r["p"] for r in table),
+        "ties_known": len(ties),
+    }
 
 
-def load_third_place_pending(con):
-    """Semi-final losers who haven't played the third-place match yet. The
-    bracket sim only models the path to the title, so it has no notion of
-    this consolation match - Golden Boot projection has to add it back in
-    by hand for the two teams it actually applies to."""
-    cols = {c[1] for c in con.execute("PRAGMA table_info(match_results)")}
-    pen = ", pen_home, pen_away" if {"pen_home", "pen_away"} <= cols else ""
-    sf_losers, third_played = set(), set()
-    for row in con.execute(f"SELECT home, away, hg, ag, matchday{pen} FROM match_results "
-                            f"WHERE matchday IN (7, 9)"):
-        home, away, hg, ag, md = row[0], row[1], row[2], row[3], row[4]
-        ph, pa = (row[5], row[6]) if pen else (None, None)
-        if hg > ag:
-            winner, loser = home, away
-        elif hg < ag:
-            winner, loser = away, home
-        elif ph is not None and pa is not None:
-            winner, loser = (home, away) if ph > pa else (away, home)
-        else:
-            continue  # level with no shootout on record — not actually decided
-        if md == 7:
-            sf_losers.add(loser)
-        else:
-            third_played.add(home)
-            third_played.add(away)
-    return sf_losers - third_played
+# ---------------------------------------------------------------------------
+# Elimination
+# ---------------------------------------------------------------------------
+def eliminated_clubs(table, ties, state):
+    """Clubs whose season is over — the 25-36 band once the league is complete,
+    plus every losing side of a decided tie."""
+    out = set()
+    if state["league_played"] >= T.N_FIXTURES:
+        out.update(r["team"] for r in table if r["band"] == "out")
+    for t in ties:
+        if t["winner"]:
+            out.add(t["other"] if t["winner"] == t["seed"] else t["seed"])
+    return out
 
 
-def build_golden_boot(con, alive):
-    """Live golden-boot standings: real current goal tallies (tracked in the
-    gb_live table, updated after every matchday via scripts/goals.py) plus
-    Paul's re-projected pick, which weighs each contender's current goals
-    against how many matches his team actually has left."""
-    ensure_gb_tables(con)
-    standings = [(p, c, g, bool(pen)) for p, c, g, pen in con.execute(
-        "SELECT player, country, goals, penalty_taker FROM gb_live")]
-    games_played, as_of, source = con.execute(
-        "SELECT games_played, as_of, source FROM gb_meta WHERE id=1").fetchone()
+# ---------------------------------------------------------------------------
+# Title race
+# ---------------------------------------------------------------------------
+def build_odds(con, teams, eliminated, limit=14):
+    rows = [{"team": t, **meta["sim"]} for t, meta in teams.items() if meta["sim"]]
+    rows.sort(key=lambda r: -r["title"])
+    alive = [r for r in rows if r["team"] not in eliminated]
+    shown = (alive or rows)[:limit]
+    return [{"team": r["team"],
+             "title": round(r["title"], 5), "final": round(r["final"], 5),
+             "semi": round(r["semi"], 5), "top8": round(r["top8"], 5),
+             "ko": round(r["ko"], 5)}
+            for r in shown]
 
-    # Total knockout matches (R16 through Final) the sim expects each team to
-    # play: the R16 tie for sure, then each later match with the modeled
-    # probability of reaching it. This total blends already-played rounds
-    # (probability settles to 1.0 once decided) with genuinely future ones.
-    total_knockout = {}
-    for team, title, final, semi, adv in con.execute(
-            "SELECT team, title, final, semi, adv FROM sim_results"):
-        total_knockout[team] = 1.0 + (adv or 0) + (semi or 0) + (final or 0)
 
-    # How many of those knockout matches has each team actually played
-    # already (already reflected in their goal tally)? Subtract that out so
-    # we only project forward for matches genuinely still ahead - otherwise
-    # a team that's already played its R16/QF/SF gets those re-counted as
-    # "remaining" on top of the goals it already banked from them.
-    played = {}
-    for home, away in con.execute("SELECT home, away FROM match_results WHERE matchday >= 5"):
-        played[home] = played.get(home, 0) + 1
-        played[away] = played.get(away, 0) + 1
+# ---------------------------------------------------------------------------
+# Top-scorer race
+# ---------------------------------------------------------------------------
+# The knockout rounds are tighter than the league phase, so a league-phase
+# scoring rate projected straight through them runs hot. Same damping factor
+# the World Cup build used on its Golden Boot projection.
+KO_DAMP = 0.7
 
-    # The sim only models the path to the title, so a semi-final loser shows
-    # zero future probability in it even though they still have the
-    # third-place match to play - add that back in explicitly.
-    third_pending = load_third_place_pending(con)
 
-    # Knockout scoring regresses (tougher defenses, fewer blowouts), so damp
-    # the extrapolated rate rather than projecting group-stage pace forward.
-    KO_DAMP = 0.7
+def expected_matches(sim):
+    """How many matches a club is expected to play across the whole season.
+
+    Eight in the league phase, then two per two-legged round it reaches, then
+    the final. ``sim_results`` records top8, ko (finish 1-24), semi, final and
+    title — but NOT the probability of reaching the round of 16 or the quarters,
+    so those two are interpolated: a play-off is close to a coin flip from the
+    seeded side's view, and the quarter-final probability sits geometrically
+    between the round of 16 and the semis. Approximate, and labelled as such on
+    the site; the alternative is no projection at all.
+    """
+    if not sim:
+        return float(T.MATCHES_EACH)
+    top8, ko, semi, final = sim["top8"], sim["ko"], sim["semi"], sim["final"]
+    p_po = max(ko - top8, 0.0)
+    p_r16 = top8 + p_po * 0.5
+    p_qf = (p_r16 * semi) ** 0.5 if p_r16 > 0 and semi > 0 else semi
+    return (T.MATCHES_EACH + 2 * p_po + 2 * p_r16 + 2 * p_qf + 2 * semi + final)
+
+
+def build_top_scorer(con, teams, table, eliminated, state):
+    """Live top-scorer standings plus Paul's re-projected pick.
+
+    ``ts_meta.games_played`` counts matches recorded across the whole
+    competition, not matches per player, so it cannot be used as a per-player
+    denominator. Each player's rate is taken against their own club's matches
+    played instead, which is the number that actually generated their goals.
+    """
+    if not _has_rows(con, "ts_live"):
+        return {"available": False, "players": [], "locked_pick": None,
+                "current_pick": None, "leader": None, "final": False,
+                "as_of": None, "source": None, "games_played": 0,
+                "max_goals": 0, "note": None}
+
+    meta = con.execute(
+        "SELECT games_played, as_of, source FROM ts_meta WHERE id=1").fetchone()
+    games_played, as_of, source = meta or (0, None, None)
+    club_played = {r["team"]: r["p"] for r in table}
+    # Knockout matches already played count toward a club's scoring rate too.
+    for h, a in _rows(con, "SELECT home, away FROM match_results "
+                           "WHERE round NOT LIKE 'md%'"):
+        for t in (h, a):
+            if t in club_played:
+                club_played[t] += 1
+
+    # ts_live stores whatever short club name the feed emitted, which may not
+    # be the canonical teams.name. Match it back so badges and elimination
+    # status line up; an unmatched club still shows, just without a badge.
+    canon = {}
+    for name in teams:
+        canon[name.lower()] = name
+    def resolve(club):
+        if club in teams:
+            return club
+        lo = club.lower()
+        if lo in canon:
+            return canon[lo]
+        hits = [n for n in teams if lo in n.lower() or n.lower() in lo]
+        return hits[0] if len(hits) == 1 else None
+
     rows = []
-    for player, country, goals, pen in standings:
-        is_alive = country in alive
-        rate = goals / games_played
-        if is_alive:
-            e_rem = max(total_knockout.get(country, 1.0) - played.get(country, 0), 0.0)
-            if country in third_pending:
-                e_rem += 1.0
-        else:
-            e_rem = 0.0
-        extra = rate * e_rem * KO_DAMP
-        projection = goals + extra
+    for player, club, goals, pen in _rows(
+            con, "SELECT player, club, goals, penalty_taker FROM ts_live"):
+        team = resolve(club)
+        alive = bool(team) and team not in eliminated and state["phase"] != "complete"
+        played = club_played.get(team, 0) if team else 0
+        rate = (goals / played) if played else 0.0
+        sim = teams.get(team, {}).get("sim") if team else None
+        remaining = max(expected_matches(sim) - played, 0.0) if alive else 0.0
+        extra = rate * remaining * KO_DAMP
         rows.append({
-            "player": player, "country": country, "flag": flag(country),
-            "goals": goals, "penalty_taker": pen, "alive": is_alive,
-            "projection": round(projection, 1),
+            "player": player, "club": team or club,
+            "club_known": bool(team),
+            "goals": goals, "pen": bool(pen), "alive": alive,
+            "played": played,
             "extra": round(extra, 1),
+            "projection": round(goals + extra, 1),
         })
-    rows.sort(key=lambda r: -r["goals"])  # goals scored so far sets the board order
+    rows.sort(key=lambda r: (-r["goals"], -r["projection"], r["player"]))
 
-    # Paul's current pick = best projected finish among players still in.
-    # Once nobody is "alive" any more (every team's tournament run, including
-    # the Final and third-place match, has been played out), there's no more
-    # projecting to do — the award is decided outright by whoever scored the
-    # most goals overall.
-    tournament_over = len(alive) == 0
-    if tournament_over:
+    over = state["phase"] == "complete" or not any(r["alive"] for r in rows)
+    if over:
         pick = rows[0] if rows else None
     else:
         pick = max((r for r in rows if r["alive"]),
@@ -361,380 +704,217 @@ def build_golden_boot(con, alive):
         r["is_pick"] = bool(pick and r["player"] == pick["player"])
 
     locked = con.execute(
-        "SELECT pick FROM locked_futures WHERE bet='golden_boot'").fetchone()
-    max_goals = max((r["goals"] for r in rows), default=1) or 1
+        "SELECT pick FROM locked_futures WHERE bet='top_scorer'").fetchone()
     return {
-        "as_of": as_of,
-        "source": source,
+        "available": True,
+        "as_of": as_of, "source": source, "games_played": games_played,
         "locked_pick": locked[0] if locked else None,
-        "locked_flag": flag_for_player(con, locked[0]) if locked else "",
         "current_pick": pick["player"] if pick else None,
         "leader": rows[0]["player"] if rows else None,
-        "final": tournament_over,
-        "max_goals": max_goals,
+        "final": over,
+        "max_goals": max((r["goals"] for r in rows), default=0),
         "players": rows,
+        "note": ("Settled — the race is over." if over else
+                 "Projection = goals so far, plus this player's rate over the "
+                 "matches their club is expected still to play (damped for the "
+                 "knockouts)."),
     }
 
 
-# Seed values for gb_live / gb_meta the first time either table is created —
-# matches scripts/goals.py's seed so both entry points agree on a fresh DB.
-GB_SEED = [
-    ("Lionel Messi", "Argentina", 7, 0),
-    ("Kylian Mbappe", "France", 6, 1),
-    ("Erling Haaland", "Norway", 5, 1),
-    ("Harry Kane", "England", 5, 1),
-    ("Ousmane Dembele", "France", 4, 0),
-    ("Vinicius Junior", "Brazil", 4, 0),
-    ("Mikel Oyarzabal", "Spain", 4, 1),
-    ("Ismaila Sarr", "Senegal", 4, 0),
-]
-GB_SEED_GAMES_PLAYED = 4
-GB_SEED_AS_OF = "Through the Round of 32"
-GB_SEED_SOURCE = "Public tournament scoring data"
+# ---------------------------------------------------------------------------
+# Futures
+# ---------------------------------------------------------------------------
+def build_futures(con, odds, ts, state):
+    picks = dict(_rows(con, "SELECT bet, pick FROM locked_futures"))
+    when = dict(_rows(con, "SELECT bet, locked_at FROM locked_futures"))
+    pts = dict(_rows(con, "SELECT kind, pts FROM futures_pts"))
+    labels = {"champion": "Champion", "top_scorer": "Top scorer"}
+
+    current = {
+        "champion": odds[0]["team"] if odds else None,
+        "top_scorer": ts.get("current_pick"),
+    }
+    settled = {
+        "champion": state["champion"],
+        "top_scorer": ts.get("leader") if ts.get("final") else None,
+    }
+
+    out = []
+    for kind in ("champion", "top_scorer"):
+        pick = picks.get(kind)
+        if pick is None:
+            out.append({"kind": kind, "label": labels[kind], "pick": None,
+                        "status": "unlocked", "pts": pts.get(kind),
+                        "current": current.get(kind), "holding": False,
+                        "earned": 0, "locked_at": None,
+                        "is_player": kind == "top_scorer"})
+            continue
+        result = settled.get(kind)
+        status = ("won" if result == pick else "lost") if result else "pending"
+        out.append({
+            "kind": kind, "label": labels[kind], "pick": pick,
+            "locked_at": when.get(kind),
+            "current": current.get(kind),
+            "holding": bool(current.get(kind)) and current.get(kind) == pick,
+            "status": status,
+            "pts": pts.get(kind),
+            "earned": pts.get(kind, 0) if status == "won" else 0,
+            "is_player": kind == "top_scorer",
+            "title_pct": (odds[0]["title"] if kind == "champion" and odds
+                          and odds[0]["team"] == pick else next(
+                              (o["title"] for o in odds if o["team"] == pick), None)),
+        })
+    return out
 
 
-def ensure_gb_tables(con):
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS gb_live (
-            player TEXT PRIMARY KEY,
-            country TEXT NOT NULL,
-            goals INTEGER NOT NULL DEFAULT 0,
-            penalty_taker INTEGER NOT NULL DEFAULT 0,
-            updated_at TEXT
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS gb_meta (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            games_played INTEGER NOT NULL,
-            as_of TEXT NOT NULL,
-            source TEXT NOT NULL
-        )
-    """)
-    if con.execute("SELECT COUNT(*) FROM gb_live").fetchone()[0] == 0:
-        con.executemany(
-            "INSERT INTO gb_live(player, country, goals, penalty_taker, updated_at) "
-            "VALUES (?,?,?,?,NULL)", GB_SEED)
-    if con.execute("SELECT COUNT(*) FROM gb_meta").fetchone()[0] == 0:
-        con.execute(
-            "INSERT INTO gb_meta(id, games_played, as_of, source) VALUES (1,?,?,?)",
-            (GB_SEED_GAMES_PLAYED, GB_SEED_AS_OF, GB_SEED_SOURCE))
-    con.commit()
-
-
-def flag_for_player(con, player):
-    row = con.execute(
-        "SELECT country FROM gb_candidates WHERE player = ?", (player,)
-    ).fetchone()
-    return flag(row[0]) if row else "\U0001F3F3"
-
-
-# Knockout bracket wiring (from scripts/r32.py and scripts/r16.py), reordered to
-# match the OFFICIAL bracket tree visual layout: each adjacent pair of R32 ties
-# feeds one R16 tie, each adjacent pair of R16 ties feeds one QF, top to bottom.
-#   QF-A: Paraguay/France + Canada/Morocco       -> France v Morocco
-#   QF-B: Portugal/Spain + USA/Belgium
-#   QF-C: Brazil/Norway + Mexico/England          -> Norway v England
-#   QF-D: Argentina/Egypt + Switzerland/Colombia
-R32_ORDER = [
-    ("Germany", "Paraguay"), ("France", "Sweden"),
-    ("South Africa", "Canada"), ("Netherlands", "Morocco"),
-    ("Portugal", "Croatia"), ("Spain", "Austria"),
-    ("USA", "Bosnia and Herzegovina"), ("Belgium", "Senegal"),
-    ("Brazil", "Japan"), ("Ivory Coast", "Norway"),
-    ("Mexico", "Ecuador"), ("England", "DR Congo"),
-    ("Argentina", "Cape Verde"), ("Australia", "Egypt"),
-    ("Switzerland", "Algeria"), ("Colombia", "Ghana"),
-]
-R16_ORDER = [
-    ("Paraguay", "France"), ("Canada", "Morocco"),
-    ("Portugal", "Spain"), ("USA", "Belgium"),
-    ("Brazil", "Norway"), ("Mexico", "England"),
-    ("Argentina", "Egypt"), ("Switzerland", "Colombia"),
-]
-
-
-def _winner(row):
-    """Predicted and actual winner team names (None if draw / not played).
-    A level knockout score is settled by the penalty shootout winner."""
-    pred_w = None
-    if row["pred_home"] > row["pred_away"]:
-        pred_w = row["home"]
-    elif row["pred_home"] < row["pred_away"]:
-        pred_w = row["away"]
-    act_w = None
-    if row["status"] == "played":
-        if row["actual_home"] > row["actual_away"]:
-            act_w = row["home"]
-        elif row["actual_home"] < row["actual_away"]:
-            act_w = row["away"]
-        elif row.get("pen_winner"):
-            act_w = row["pen_winner"]
-    return pred_w, act_w
-
-
-def build_bracket(preds):
-    """Structured knockout bracket: R32 -> R16 -> QF -> SF -> Final. Rounds not
-    yet predicted are emitted as empty placeholder slots so the tree is complete."""
-    by_key = {(p["home"], p["away"]): p for p in preds}
-
-    def match_from(pair):
-        p = by_key.get(pair)
-        if not p:
-            return None
-        pred_w, act_w = _winner(p)
-        return {
-            "home": p["home"], "away": p["away"],
-            "home_flag": p["home_flag"], "away_flag": p["away_flag"],
-            "home_tier": p["home_tier"], "away_tier": p["away_tier"],
-            "pred_home": p["pred_home"], "pred_away": p["pred_away"],
-            "pred_winner": pred_w,
-            "confidence": p.get("confidence"),
-            "status": p["status"], "hit": p["hit"],
-            "actual_home": p["actual_home"], "actual_away": p["actual_away"],
-            "actual_winner": act_w,
-            "pen_home": p.get("pen_home"), "pen_away": p.get("pen_away"),
-            "pen_winner": p.get("pen_winner"),
-        }
-
-    def qf_match(tie_a, tie_b):
-        """Resolve the real quarter-final fed by two adjacent R16 ties. Returns
-        the locked prediction once both legs are decided; otherwise a small
-        "awaiting" marker naming whichever R16 tie(s) still need to finish —
-        never a guessed matchup."""
-        ra, rb = by_key.get(tie_a), by_key.get(tie_b)
-        wa = _winner(ra)[1] if ra else None
-        wb = _winner(rb)[1] if rb else None
-        if wa and wb:
-            return match_from((wa, wb)) or match_from((wb, wa))
-        pending = [f"{h} v {a}" for (h, a), w in ((tie_a, wa), (tie_b, wb)) if not w]
-        return {"pending_on": pending}
-
-    def sf_match(qf_a, qf_b):
-        """Resolve the real semi-final fed by two adjacent quarter-final ties
-        (each itself a pair of R16 ties). Returns the locked prediction once
-        both QFs are decided; otherwise a small "awaiting" marker naming
-        whichever QF tie(s) still need to finish."""
-        def qf_winner_or_wait(qf_tie):
-            tie_a, tie_b = qf_tie
-            m = qf_match(tie_a, tie_b)
-            if m and m.get("actual_winner"):
-                return m["actual_winner"], None
-            if m and "pending_on" in m:
-                return None, m["pending_on"]
-            # QF matchup is locked but hasn't been played yet.
-            label = f"{m['home']} v {m['away']}" if m else \
-                f"{tie_a[0]} v {tie_a[1]} / {tie_b[0]} v {tie_b[1]}"
-            return None, [label]
-
-        wa, pa = qf_winner_or_wait(qf_a)
-        wb, pb = qf_winner_or_wait(qf_b)
-        if wa and wb:
-            return match_from((wa, wb)) or match_from((wb, wa))
-        pending = [x for lst in (pa, pb) if lst for x in lst]
-        return {"pending_on": pending}
-
-    def final_match(sf_a, sf_b):
-        """Resolve the real Final fed by the two semi-final ties (each itself
-        a pair of adjacent QF ties). Returns the locked prediction once both
-        SFs are decided; otherwise a small "awaiting" marker naming whichever
-        SF tie(s) still need to finish."""
-        def sf_winner_or_wait(sf_tie):
-            qf_a, qf_b = sf_tie
-            m = sf_match(qf_a, qf_b)
-            if m and m.get("actual_winner"):
-                return m["actual_winner"], None
-            if m and "pending_on" in m:
-                return None, m["pending_on"]
-            # SF matchup is locked but hasn't been played yet.
-            label = f"{m['home']} v {m['away']}" if m else \
-                f"{qf_a[0][0]} v {qf_a[0][1]} / {qf_a[1][0]} v {qf_a[1][1]} " \
-                f"or {qf_b[0][0]} v {qf_b[0][1]} / {qf_b[1][0]} v {qf_b[1][1]}"
-            return None, [label]
-
-        wa, pa = sf_winner_or_wait(sf_a)
-        wb, pb = sf_winner_or_wait(sf_b)
-        if wa and wb:
-            return match_from((wa, wb)) or match_from((wb, wa))
-        pending = [x for lst in (pa, pb) if lst for x in lst]
-        return {"pending_on": pending}
-
-    def third_match(sf_a, sf_b):
-        """Resolve the real third-place playoff fed by the LOSERS of the two
-        semi-finals (each itself a pair of adjacent QF ties). Returns the
-        locked prediction once both SFs are decided; otherwise a small
-        "awaiting" marker naming whichever SF tie(s) still need to finish."""
-        def sf_loser_or_wait(sf_tie):
-            qf_a, qf_b = sf_tie
-            m = sf_match(qf_a, qf_b)
-            if m and m.get("actual_winner"):
-                loser = m["away"] if m["actual_winner"] == m["home"] else m["home"]
-                return loser, None
-            if m and "pending_on" in m:
-                return None, m["pending_on"]
-            # SF matchup is locked but hasn't been played yet.
-            label = f"{m['home']} v {m['away']}" if m else \
-                f"{qf_a[0][0]} v {qf_a[0][1]} / {qf_a[1][0]} v {qf_a[1][1]} " \
-                f"or {qf_b[0][0]} v {qf_b[0][1]} / {qf_b[1][0]} v {qf_b[1][1]}"
-            return None, [label]
-
-        la, pa = sf_loser_or_wait(sf_a)
-        lb, pb = sf_loser_or_wait(sf_b)
-        if la and lb:
-            return match_from((la, lb)) or match_from((lb, la))
-        pending = [x for lst in (pa, pb) if lst for x in lst]
-        return {"pending_on": pending}
-
-    qf_ties = [(R16_ORDER[i], R16_ORDER[i + 1]) for i in range(0, 8, 2)]
-    sf_ties = [(qf_ties[0], qf_ties[1]), (qf_ties[2], qf_ties[3])]
-    return [
-        {"key": "r32", "label": "Round of 32",
-         "matches": [match_from(x) for x in R32_ORDER]},
-        {"key": "r16", "label": "Round of 16",
-         "matches": [match_from(x) for x in R16_ORDER]},
-        {"key": "qf", "label": "Quarter-finals",
-         "matches": [qf_match(a, b) for a, b in qf_ties]},
-        {"key": "sf", "label": "Semi-finals",
-         "matches": [sf_match(a, b) for a, b in sf_ties]},
-        {"key": "final", "label": "Final",
-         "matches": [final_match(sf_ties[0], sf_ties[1])]},
-        {"key": "third", "label": "Third-place",
-         "matches": [third_match(sf_ties[0], sf_ties[1])]},
-    ]
-
-
-def build_odds(con, alive=None):
-    rows = con.execute(
-        "SELECT team, title, final, semi, adv FROM sim_results ORDER BY title DESC"
-    ).fetchall()
-    if alive:
-        rows = [r for r in rows if r[0] in alive]
-    rows = rows[:12]
-    return [
-        {"team": t, "flag": flag(t), "title": ti, "final": f, "semi": s, "advance": a}
-        for t, ti, s, f, a in [(r[0], r[1], r[3], r[2], r[4]) for r in rows]
-    ]
-
-
-def summarize(preds, futures):
-    played = [p for p in preds if p["status"] == "played"]
-    exact = sum(1 for p in played if p["hit"] == "exact")
-    dir_only = sum(1 for p in played if p["hit"] == "dir")
-    miss = sum(1 for p in played if p["hit"] == "miss")
-    correct = exact + dir_only
-    n = len(played)
+def build_title_race(odds, futures, state):
+    champ = next((f for f in futures if f["kind"] == "champion"), None)
+    top = odds[0] if odds else None
     return {
-        "matches_scored": n,
-        "exact": exact,
-        "direction_only": dir_only,
-        "miss": miss,
-        "outcome_accuracy": round(correct / n, 4) if n else 0,
-        "exact_rate": round(exact / n, 4) if n else 0,
-        "pending": sum(1 for p in preds if p["status"] == "pending"),
+        "locked_pick": champ["pick"] if champ else None,
+        "current_pick": top["team"] if top else None,
+        "title_pct": top["title"] if top else None,
+        "holding": bool(champ and champ.get("holding")),
+        "sims": SIM_COUNT,
+        "conditioned_on": state["league_played"] + state["knockout_played"],
+        "available": bool(odds),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scorecard
+# ---------------------------------------------------------------------------
+def summarize(rounds, futures):
+    graded = sum(r["graded"] for r in rounds)
+    exact = sum(r["exact"] for r in rounds)
+    dirs = sum(r["dir"] for r in rounds)
+    miss = sum(r["miss"] for r in rounds)
+    pts = sum(r["pts"] for r in rounds)
+    max_pts = sum(r["max_pts"] for r in rounds)
+    fut_pts = sum(f["earned"] for f in futures)
+    fut_max = sum(f["pts"] or 0 for f in futures if f["pick"])
+    return {
+        "graded": graded, "exact": exact, "direction_only": dirs, "miss": miss,
+        "correct": exact + dirs,
+        "outcome_accuracy": round((exact + dirs) / graded, 4) if graded else None,
+        "exact_rate": round(exact / graded, 4) if graded else None,
+        "locked": sum(r["locked"] for r in rounds),
+        "pending": sum(r["locked"] - r["graded"] for r in rounds),
+        "scheduled": sum(r["n"] for r in rounds),
+        "points": pts + fut_pts,
+        "points_match": pts,
+        "points_futures": fut_pts,
+        "points_max": max_pts + fut_max,
+        "points_rate": round((pts + fut_pts) / (max_pts + fut_max), 4)
+                       if (max_pts + fut_max) else None,
         "futures_open": sum(1 for f in futures if f["status"] == "pending"),
     }
 
 
-def build_timeline(preds):
-    """Per-round accuracy in chronological order, plus a running cumulative
-    accuracy so the model's improvement over the tournament is visible."""
-    order = []
-    groups = {}
-    for p in preds:
-        if p["status"] != "played":
+def build_timeline(rounds):
+    """Round-by-round accuracy with a running cumulative line — the chart that
+    shows whether re-fitting after every matchday is actually buying anything."""
+    tl, c_ok = [], 0
+    c_n = c_exact = c_pts = c_max = 0
+    for r in rounds:
+        if not r["graded"]:
             continue
-        r = p["round"]
-        if r not in groups:
-            groups[r] = []
-            order.append(r)
-        groups[r].append(p)
-
-    timeline = []
-    cum_correct = cum_n = cum_exact = 0
-    for r in order:
-        rows = groups[r]
-        n = len(rows)
-        correct = sum(1 for p in rows if p["hit"] in ("exact", "dir"))
-        exact = sum(1 for p in rows if p["hit"] == "exact")
-        cum_correct += correct
-        cum_n += n
-        cum_exact += exact
-        timeline.append({
-            "round": r,
-            "matches": n,
-            "exact": exact,
-            "accuracy": round(correct / n, 4) if n else 0,
-            "exact_rate": round(exact / n, 4) if n else 0,
-            "cum_accuracy": round(cum_correct / cum_n, 4) if cum_n else 0,
-            "cum_exact_rate": round(cum_exact / cum_n, 4) if cum_n else 0,
+        ok = r["exact"] + r["dir"]
+        c_ok += ok; c_n += r["graded"]; c_exact += r["exact"]
+        c_pts += r["pts"]; c_max += r["max_pts"]
+        tl.append({
+            "round": r["id"], "label": r["label"], "n": r["graded"],
+            "exact": r["exact"],
+            "accuracy": round(ok / r["graded"], 4),
+            "exact_rate": round(r["exact"] / r["graded"], 4),
+            "cum_accuracy": round(c_ok / c_n, 4),
+            "cum_exact_rate": round(c_exact / c_n, 4),
+            "pts": r["pts"], "cum_pts": c_pts,
+            "cum_pts_rate": round(c_pts / c_max, 4) if c_max else 0,
         })
-    return timeline
+    return tl
 
 
-def build_title_race(con, odds, preds=None):
-    """Champion pick summary for the Title Race banner: the locked pre-tournament
-    pick vs Paul's current bracket-aware favourite, plus its title probability.
+# ---------------------------------------------------------------------------
+def build_payload(con):
+    teams = load_teams(con)
+    scoring = load_scoring(con)
+    fixtures = load_fixtures(con)
+    picks = load_picks(con)
+    results = load_results(con)
 
-    Also reports how many Round of 16 ties are actually decided so far, since
-    the Monte Carlo locks in real results but still simulates everything
-    unplayed — teams already through show 100% to reach the QF because
-    that specific game is over, not because the whole round is finished."""
-    locked = con.execute(
-        "SELECT pick FROM locked_futures WHERE bet='champion'").fetchone()
-    locked_pick = locked[0] if locked else None
-    current = odds[0]["team"] if odds else None
-    r16 = [p for p in (preds or []) if p.get("stage") == "r16"]
-    r16_played = sum(1 for p in r16 if p["status"] == "played")
+    table = build_table(con, teams, results)
+    rounds = build_rounds(con, fixtures, picks, results, scoring)
+    ties = build_ties(con, fixtures, picks, results, scoring)
+    state = season_state(teams, rounds, table, ties)
+    elim = eliminated_clubs(table, ties, state)
+    bracket = build_bracket(table, ties, rounds, results)
+    odds = build_odds(con, teams, elim)
+    ts = build_top_scorer(con, teams, table, elim, state)
+    futures = build_futures(con, odds, ts, state)
+    title_race = build_title_race(odds, futures, state)
+    summary = summarize(rounds, futures)
+    timeline = build_timeline(rounds)
+
     return {
-        "locked_pick": locked_pick,
-        "locked_flag": flag(locked_pick) if locked_pick else "",
-        "current_pick": current,
-        "current_flag": flag(current) if current else "",
-        "title_pct": odds[0]["title"] if odds else None,
-        "holding": (current == locked_pick),
-        "sims": SIM_COUNT,
-        "r16_played": r16_played,
-        "r16_total": len(r16),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "tournament": TOURNAMENT,
+        "state": state,
+        "format": {
+            "n_teams": T.N_TEAMS,
+            "matches_each": T.MATCHES_EACH,
+            "n_fixtures": T.N_FIXTURES,
+            "cutlines": build_cutlines(),
+            "tiebreakers": list(T.TIEBREAKERS),
+            "home_elo": T.HOME_ELO,
+            "seed_hosts_second_leg": T.SEED_HOSTS_SECOND_LEG,
+            "tie_break": list(T.TIE_BREAK),
+            "rounds": [{"id": r.id, "label": r.label, "legs": r.legs,
+                        "phase": r.phase, "neutral": r.neutral,
+                        "dir_pts": scoring.get(r.id, (None, None))[0],
+                        "exact_pts": scoring.get(r.id, (None, None))[1]}
+                       for r in T.ROUNDS],
+        },
+        # The points game is deliberately not the public headline; the site
+        # keeps it behind a toggle. See README, "Internal scoring".
+        "scoring": {"public": False,
+                    "futures_pts": dict(_rows(
+                        con, "SELECT kind, pts FROM futures_pts"))},
+        "summary": summary,
+        "timeline": timeline,
+        "teams": teams,
+        "table": table,
+        "eliminated": sorted(elim),
+        "rounds": rounds,
+        "ties": ties,
+        "bracket": bracket,
+        "odds": odds,
+        "title_race": title_race,
+        "top_scorer": ts,
+        "futures": futures,
     }
-
-
-SIM_COUNT = 20000
 
 
 def main():
-    con = sqlite3.connect(DB)
-    scoring = load_scoring(con)
-    results = load_results(con)
-    elo = load_elo(con)
-    conf = load_conf(con)
-    preds = build_predictions(con, scoring, results, elo, conf)
-    alive = load_alive(con)
-    golden_boot = build_golden_boot(con, alive)
-    futures = build_futures(con, gb_pick=golden_boot.get("current_pick"), gb_final=golden_boot.get("final", False))
-    odds = build_odds(con, alive)
-    title_race = build_title_race(con, odds, preds)
-    bracket = build_bracket(preds)
-    summary = summarize(preds, futures)
-    timeline = build_timeline(preds)
-    con.close()
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        payload = build_payload(con)
+    finally:
+        con.close()
 
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "summary": summary,
-        "timeline": timeline,
-        "predictions": preds,
-        "bracket": bracket,
-        "futures": futures,
-        "golden_boot": golden_boot,
-        "title_race": title_race,
-        "odds": odds,
-    }
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "w") as f:
-        json.dump(payload, f, indent=2)
-    print(f"Wrote {OUT}: {summary['matches_scored']} graded, "
-          f"{summary['outcome_accuracy']*100:.1f}% outcome accuracy, "
-          f"{len(preds)} predictions total.")
+    with open(OUT, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+
+    s, size = payload["summary"], os.path.getsize(OUT)
+    acc = f"{s['outcome_accuracy'] * 100:.1f}%" if s["outcome_accuracy"] else "n/a"
+    print(f"Wrote {OUT} ({size / 1024:.0f} KB)")
+    print(f"  {payload['tournament']} — phase: {payload['state']['phase']}, "
+          f"{payload['state']['teams_known']}/{T.N_TEAMS} clubs known")
+    print(f"  {s['graded']} graded, {acc} outcome accuracy, "
+          f"{s['exact']} exact, {s['points']}/{s['points_max']} pts (internal)")
+    print(f"  {len(payload['table'])} table rows, {len(payload['ties'])} ties, "
+          f"{len(payload['odds'])} clubs in the title race")
 
 
 if __name__ == "__main__":

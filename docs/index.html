@@ -2,213 +2,157 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Paul the Agent · AI World Cup Predictions</title>
-  <meta name="description" content="AI-modeled predictions for the 2026 FIFA World Cup — live scorecard, accuracy, and title race." />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Paul the Agent · Champions League predictions, graded</title>
+  <meta name="description" content="An ensemble model locks a scoreline before every 2026/27 Champions League kickoff, then grades itself against the result. Live league table, knockout bracket, title race." />
   <meta name="theme-color" content="#080b0a" />
+  <meta name="color-scheme" content="dark" />
 
-  <!-- Open Graph / social sharing -->
   <meta property="og:type" content="website" />
   <meta property="og:site_name" content="Paul the Agent" />
-  <meta property="og:title" content="Paul the Agent · AI World Cup Predictions" />
-  <meta property="og:description" content="AI-modeled predictions for the 2026 FIFA World Cup — live scorecard, accuracy, and title race." />
-  <meta property="og:url" content="https://nakashon.github.io/paul-the-agent/" />
-  <meta property="og:image" content="https://nakashon.github.io/paul-the-agent/og-image.png" />
-  <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="Paul the Agent · AI World Cup Predictions" />
-  <meta name="twitter:description" content="AI-modeled predictions for the 2026 FIFA World Cup — live scorecard, accuracy, and title race." />
-  <meta name="twitter:image" content="https://nakashon.github.io/paul-the-agent/og-image.png" />
+  <meta property="og:title" content="Paul the Agent · Champions League predictions, graded" />
+  <meta property="og:description" content="Every pick locked before kickoff, then graded against reality. 36 clubs, one table, two-legged knockouts." />
+  <meta property="og:url" content="https://orrwein.github.io/paul-the-agent-ucl/" />
+  <meta name="twitter:card" content="summary" />
 
   <link rel="icon" href="favicon.svg" type="image/svg+xml" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <a class="skip" href="#main">Skip to content</a>
+
   <div class="bg-orbs" aria-hidden="true">
-    <span class="orb orb-1"></span>
-    <span class="orb orb-2"></span>
-    <span class="orb orb-3"></span>
+    <span class="orb orb-1"></span><span class="orb orb-2"></span><span class="orb orb-3"></span>
   </div>
 
   <header class="nav">
-    <div class="brand">
-      <span class="logo">🐙</span>
+    <a class="brand" href="#main">
+      <span class="logo" aria-hidden="true">🐙</span>
       <span>Paul <b>the Agent</b></span>
-    </div>
-    <nav class="nav-links">
+    </a>
+    <nav class="nav-links" aria-label="Sections">
       <a href="#scorecard">Scorecard</a>
-      <a href="#trend">Trend</a>
+      <a href="#table">League table</a>
+      <a href="#picks">Picks</a>
       <a href="#bracket">Bracket</a>
-      <a href="#predictions">Predictions</a>
+      <a href="#race">Title race</a>
+      <a href="#scorer">Top scorer</a>
       <a href="#futures">Futures</a>
-      <a href="#goldenboot">Golden Boot</a>
-      <a href="#race">Title Race</a>
       <a href="#method">Method</a>
-      <a href="#retro">Final Report</a>
     </nav>
-    <a class="gh-link" href="https://github.com/nakashon/paul-the-agent" target="_blank" rel="noopener">
-      <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-        <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
-          0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
-          -.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66
-          .07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15
-          -.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0
-          1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82
-          1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01
-          1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/>
+    <a class="gh-link" href="https://github.com/orrwein/paul-the-agent-ucl" rel="noopener">
+      <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false">
+        <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/>
       </svg>
       <span>GitHub</span>
     </a>
   </header>
 
-  <main>
-    <section class="hero">
-      <div class="tag">2026 FIFA World Cup · Model v1</div>
-      <h1>Every match, <span class="grad">modeled &amp; scored.</span></h1>
-      <p class="lede">A Dixon–Coles + Elo engine locks a scoreline before kickoff, then grades itself against reality. No hindsight, no edits — just the receipts.</p>
+  <main id="main">
+    <section class="hero" aria-labelledby="heroTitle">
+      <p class="tag" id="heroTag">2026/27 UEFA Champions League</p>
+      <h1 id="heroTitle">Every match, <span class="grad">modelled &amp; scored.</span></h1>
+      <p class="lede">A Dixon–Coles + Elo engine locks a scoreline before kickoff, then grades itself against reality. Thirty-six clubs, one table, two-legged knockouts — no hindsight, no edits, just the receipts.</p>
+      <div class="hero-state" id="heroState"></div>
       <div class="hero-stats" id="heroStats"></div>
-      <div class="updated" id="updated"></div>
+      <p class="updated" id="updated"></p>
     </section>
 
-    <section id="scorecard" class="section">
+    <section id="scorecard" class="section" aria-labelledby="scorecardH">
       <div class="section-head">
-        <h2>Live Scorecard</h2>
-        <p>How the model is performing across every graded fixture.</p>
+        <h2 id="scorecardH">Live scorecard</h2>
+        <p>How the model is doing across every graded fixture. A pick is <b>exact</b> when the scoreline lands on the nose, <b>right winner</b> when the outcome was called but not the score, and a <b>miss</b> otherwise.</p>
       </div>
       <div class="cards" id="scoreCards"></div>
+      <div class="pts-toggle">
+        <button type="button" id="ptsBtn" aria-pressed="false" aria-controls="ptsPanel">Show the internal points game</button>
+        <span class="pts-note">The public dashboard leads with accuracy; the points table runs a private prediction game.</span>
+      </div>
+      <div class="pts-panel" id="ptsPanel" hidden></div>
     </section>
 
-    <section id="trend" class="section">
+    <section id="trend" class="section" aria-labelledby="trendH">
       <div class="section-head">
-        <h2>Getting Sharper</h2>
-        <p>Accuracy per round and the running cumulative accuracy — the model re-fits its Elo, form and calibration after every matchday.</p>
+        <h2 id="trendH">Getting sharper</h2>
+        <p>Accuracy per round, and the running cumulative line. The model refits its calibration, form and ratings after every matchday — this is whether that buys anything.</p>
       </div>
-      <div class="trend-wrap">
-        <div class="trend-chart" id="trendChart"></div>
-        <div class="trend-legend">
-          <span><i class="sw sw-acc"></i>Round accuracy</span>
-          <span><i class="sw sw-eff"></i>Cumulative accuracy</span>
-        </div>
-      </div>
+      <div class="trend-wrap" id="trendWrap"></div>
     </section>
 
-    <section id="bracket" class="section">
+    <section id="table" class="section" aria-labelledby="tableH">
       <div class="section-head">
-        <h2>Knockout Bracket</h2>
-        <p>Paul's path to the trophy. Each tie shows the predicted scoreline; the predicted winner is highlighted, and played ties are graded once the result is in.</p>
+        <h2 id="tableH">The league table</h2>
+        <p>One table, thirty-six clubs, eight matches each. Finish top eight and you skip straight to the round of 16; ninth to twenty-fourth go into a two-legged play-off; twenty-fifth and below go home.</p>
       </div>
-      <div class="bracket-scroll">
-        <div class="bracket" id="bracketTree"></div>
-      </div>
+      <div id="tableWrap"></div>
     </section>
 
-    <section id="predictions" class="section">
+    <section id="picks" class="section" aria-labelledby="picksH">
       <div class="section-head">
-        <h2>Predictions &amp; Results</h2>
-        <p>Every pick is locked before kickoff. Each card shows <b class="hl-pred">what Paul predicted</b> next to <b class="hl-real">what actually happened</b> — then grades itself.</p>
+        <h2 id="picksH">Picks vs results</h2>
+        <p>Every pick is written to the database before kickoff and never edited. Each row shows <b class="hl-pred">what Paul called</b> against <b class="hl-real">what actually happened</b>.</p>
       </div>
-      <div class="legend">
-        <span class="lg"><i class="lg-dot d-exact"></i>Exact score — nailed the exact scoreline</span>
-        <span class="lg"><i class="lg-dot d-dir"></i>Right winner — called the outcome, not the score</span>
-        <span class="lg"><i class="lg-dot d-miss"></i>Missed — wrong outcome</span>
-      </div>
-      <div class="filters" id="filters"></div>
-      <div class="pred-list" id="predBody"></div>
+      <ul class="legend" id="legend">
+        <li><i class="lg-dot d-exact" aria-hidden="true"></i>Exact score</li>
+        <li><i class="lg-dot d-dir" aria-hidden="true"></i>Right winner</li>
+        <li><i class="lg-dot d-miss" aria-hidden="true"></i>Miss</li>
+        <li><i class="lg-dot d-pending" aria-hidden="true"></i>Not played yet</li>
+      </ul>
+      <div class="filters" id="filters" role="group" aria-label="Filter picks by round"></div>
+      <div id="pickList"></div>
     </section>
 
-    <section id="futures" class="section">
+    <section id="bracket" class="section" aria-labelledby="bracketH">
       <div class="section-head">
-        <h2>Futures</h2>
-        <p>The long bets locked at the start of the tournament — shown against Paul's current live favourite, so you can watch them hold or drift.</p>
+        <h2 id="bracketH">Knockout bracket</h2>
+        <p>Every pairing is fixed by league position — only the slot inside each band is drawn. The better-placed club hosts the second leg, ties are settled on aggregate, and there is no away-goals rule.</p>
       </div>
-      <div class="futures" id="futures"></div>
+      <div id="bracketWrap"></div>
     </section>
 
-    <section id="goldenboot" class="section">
+    <section id="race" class="section" aria-labelledby="raceH">
       <div class="section-head">
-        <h2>Golden Boot Race</h2>
-        <p>Today's live top-scorer standings with each contender's current goal count — plus Paul's updated pick, re-projected from goals scored and how deep each player's team is expected to run. ⚽ marks a penalty taker.</p>
-      </div>
-      <div class="pick-banner" id="gbPick"></div>
-      <div class="gb-board" id="goldenBoot"></div>
-    </section>
-
-    <section id="race" class="section">
-      <div class="section-head">
-        <h2>Title Race</h2>
-        <p>Championship odds from 20,000 simulations of the <b>actual set bracket</b>. Ties already played are locked in as certain — that's why a team can show 100% to reach the next round while the round itself is still underway — and every tie still to be played is simulated by the model, path and all.</p>
+        <h2 id="raceH">Title race</h2>
+        <p>Probabilities from Monte Carlo simulations of the real 144-fixture schedule and the bracket it feeds. Matches already played are forced, so these are live odds conditioned on what has actually happened.</p>
       </div>
       <div class="pick-banner" id="titlePick"></div>
-      <div class="race" id="raceList"></div>
+      <div id="raceWrap"></div>
     </section>
 
-    <section id="method" class="section">
+    <section id="scorer" class="section" aria-labelledby="scorerH">
       <div class="section-head">
-        <h2>Behind the Scenes</h2>
-        <p>Paul isn't a lucky octopus. Every pick is an ensemble of opponent-aware signals fused into expected goals, then a probability matrix over every scoreline.</p>
+        <h2 id="scorerH">Top scorer race</h2>
+        <p>Live standings, plus Paul's re-projected pick — current goals, extended by each player's rate over the matches their club is still expected to play. ⚽ marks a penalty taker.</p>
+      </div>
+      <div class="pick-banner" id="scorerPick"></div>
+      <div id="scorerWrap"></div>
+    </section>
+
+    <section id="futures" class="section" aria-labelledby="futuresH">
+      <div class="section-head">
+        <h2 id="futuresH">Futures</h2>
+        <p>The two season-long bets, locked before matchday one and shown against Paul's current live favourite, so you can watch them hold or drift.</p>
+      </div>
+      <div class="futures" id="futuresWrap"></div>
+    </section>
+
+    <section id="method" class="section" aria-labelledby="methodH">
+      <div class="section-head">
+        <h2 id="methodH">Behind the scenes</h2>
+        <p>Paul isn't a lucky octopus. Every pick is an ensemble of opponent-aware signals fused into expected goals, then a probability matrix over every scoreline, then the pick that maximises that round's points.</p>
       </div>
       <div class="methods" id="methods"></div>
-      <div class="pipeline">
-        <span>Elo + Form + Momentum + Market</span>
-        <b>→</b><span>Expected goals λ</span>
-        <b>→</b><span>Dixon–Coles matrix</span>
-        <b>→</b><span>Calibrated pick</span>
-        <b>→</b><span>20k simulations</span>
-      </div>
-    </section>
-
-    <!--
-      2026 World Cup retrospective. This narrative is historical commentary
-      on the completed 2026 tournament -- if you reuse this pipeline for a
-      future tournament (see README "Starting a new tournament"), rewrite
-      the prose below to match that season's story. The stat banner above it
-      stays accurate on its own since it's rendered from data.json.
-    -->
-    <section id="retro" class="section">
-      <div class="section-head">
-        <h2>Final Report <span class="retro-badge">2026 Retrospective</span></h2>
-        <p>The tournament is over and the record is locked. Here's an honest look at what the model got right, what it missed, and why.</p>
-      </div>
-      <div class="final-banner" id="finalBanner"></div>
-      <div class="retro-grid">
-        <div class="retro-card retro-good">
-          <h3>✅ What worked</h3>
-          <ul>
-            <li>Both season-long futures — <b>Champion (Spain)</b> and <b>Golden Boot (Kylian Mbappé)</b> — were locked before a ball was kicked, and both held all the way through.</li>
-            <li>Mbappé finished on <b>10 goals</b>, clear of Messi (8) and Haaland (7) — the pick was never seriously threatened after the group stage.</li>
-            <li>The Elo + Dixon–Coles core called the right side of the result in <b>75.8%</b> of graded matches, and accuracy climbed as the model re-fit itself after every matchday (see "Getting Sharper" above).</li>
-            <li>The Final: Paul had Spain to beat Argentina, and Spain did — 1–0, just not the 2–1 scoreline predicted.</li>
-          </ul>
-        </div>
-        <div class="retro-card retro-miss">
-          <h3>❌ What missed</h3>
-          <ul>
-            <li>Exact scorelines are brutally hard: only <b>11.0%</b> (10 of 91) landed on the nose. Football's low-scoring, high-variance nature punishes point predictions even when the process behind them is sound.</li>
-            <li>The single biggest miss: the <b>Third-place playoff</b>. Paul had France edging England 1–0 — instead it was a ten-goal thriller, <b>England 6–4</b>. No model saw that one coming.</li>
-            <li>Mid-tournament, the per-match model and the whole-bracket simulation briefly told two different stories — one had France eliminating Spain in a single tie, the other still had Spain as the runaway favourite to win it all. Both were "correct" for what they measured; single-match upsets and tournament-long favourites are different questions.</li>
-          </ul>
-        </div>
-      </div>
-      <div class="oss-callout">
-        <span class="oss-ic">🐙</span>
-        <div class="oss-body">
-          <div class="oss-title">Open source, MIT licensed</div>
-          <p>Every model, script and result behind this report is public — the Elo ratings, the Dixon–Coles fit, the calibration, the Monte Carlo bracket sim, all of it. Fork it, point it at the next tournament, or just read the code that made these calls.</p>
-        </div>
-        <a class="oss-btn" href="https://github.com/nakashon/paul-the-agent" target="_blank" rel="noopener">View source ↗</a>
-      </div>
+      <ol class="pipeline" id="pipeline"></ol>
     </section>
   </main>
 
   <footer class="foot">
-    <span>Paul the Agent · predictions generated by an ensemble model, self-graded with no edits.</span>
-    <span>
-      <a href="https://github.com/nakashon/paul-the-agent" target="_blank" rel="noopener">Source on GitHub</a>
-      · MIT licensed
-    </span>
-    <span id="footUpdated"></span>
+    <p>Paul the Agent · predictions generated by an ensemble model and self-graded, with no edits after the fact.</p>
+    <p>
+      <a href="https://github.com/orrwein/paul-the-agent-ucl" rel="noopener">Source on GitHub</a> · MIT licensed ·
+      forked from <a href="https://github.com/nakashon/paul-the-agent" rel="noopener">nakashon/paul-the-agent</a>
+    </p>
+    <p id="footUpdated"></p>
   </footer>
 
   <script src="app.js"></script>
