@@ -37,24 +37,94 @@ MAXG = 9
 # day before kickoff. Cross-validated across the two seasons. The upstream
 # World Cup values are noted for comparison — every one of them was wrong for
 # club football, several by a lot.
-RHO = 0.21                # Dixon-Coles low-score dependence (WC build: -0.11)
-DRAW_BOOST = 1.0          # diagonal (draw) inflation, calibrated from results
-BASE_TOTAL = 3.42         # avg goals/game anchor for Elo component (was 2.65)
+RHO = 0.23                # Dixon-Coles low-score dependence (WC build: -0.11)
+DRAW_BOOST = 1.06         # diagonal (draw) inflation, calibrated from results
+BASE_TOTAL = 3.35         # avg goals/game anchor for Elo component (was 2.65)
 ELO_TO_GOALS = 0.600      # goals of supremacy per 100 Elo (was 0.34)
 MU = BASE_TOTAL / 2       # avg goals per team for form component (was 1.33)
 
+# BASE_TOTAL came down from 3.42 because the backtest used to grade against
+# football-data's `fullTime`, which for a tie that went past 90 minutes
+# INCLUDES extra time and the shootout — Liverpool 0-1 PSG arrived as "1-5".
+# Six matches across the two seasons were affected, all of them second legs.
+# Grading on the 90-minute score is both correct and slightly less generous.
+#
 # On the sign of RHO: the textbook Dixon-Coles value is negative, because
 # domestic leagues show an excess of 0-0 and 1-1 draws over independent
 # Poisson. This competition does the opposite. The observed draw rate across
-# both seasons is 14-17% against roughly 25% in a typical league, on 3.42
+# both seasons is 14-17% against roughly 25% in a typical league, on 3.35
 # goals a game — a 36-club field where everyone qualified produces FEWER
 # low-score draws than Poisson expects. The positive fit is the model
 # reflecting that, not an artefact.
+#
+# That argument is now known to be only half right, and the other half is
+# recorded here so nobody re-derives it the hard way. Draws in AGGREGATE are
+# rare, but 0-0 specifically is over-represented: 5.0% observed against the
+# 3.5% independent Poisson implies at this goal rate. A positive RHO plus a
+# draw_boost above 1 fits the aggregate draw rate by evicting mass from the
+# 0-0 corner, and at RHO=0.23 the model predicts 0-0 at about 1.5%. Fitting
+# RHO on full SCORELINE likelihood instead says rho=-0.03 / draw_boost=0.79 —
+# it suppresses draws through the diagonal rather than through the corner, and
+# gets 0-0 to 3.0%. Both fits were cross-validated head to head:
+#
+#     fitted on          rho    boost   pts/match   outcome LL   scoreline LL
+#     outcome LL       +0.27     1.13       0.783        0.898          3.262
+#     scoreline LL     -0.03     0.79       0.751        0.898          3.228
+#
+# The outcome fit is kept because points-per-match is what this project is
+# paid, and the two are level on the calibration check. It costs 0.034 nats of
+# scoreline likelihood and a visibly wrong 0-0 probability. The points gap is
+# about six extra exact scores across 378 matches and is NOT significant — if
+# a third season lands and reverses it, switch, and do not feel clever about
+# either choice.
+#
+# One more caution, because it is the kind of thing that makes a change look
+# better than it is. The two seasons fit this pair very differently — 2024
+# wants rho=+0.24/boost=0.94, 2025 wants rho=+0.30/boost=1.32 — and the single
+# compromise below scores WORSE on points than either season's own value does
+# on its own matches. So the cross-validated 0.783 pts/match is not what these
+# exact constants deliver; graded as one global set over all 378 matches they
+# give 0.746, against 0.751 for the pre-fit values. What this change actually
+# buys, and buys solidly, is calibration: outcome log-loss 0.906 -> 0.893 and
+# scoreline log-loss 3.312 -> 3.234. The points are a wash. Anyone quoting the
+# cross-validated number as if it were the shipped one is mixing protocols.
+
 # ensemble weights. Market odds aggregate everything the public knows, so when
 # present they dominate match DIRECTION; Elo/form/intel mainly shape the exact
 # SCORELINE (where our competition edge actually lives).
-W_NO_MKT = dict(elo=0.60, form=0.40, mkt=0.0)
-W_MKT = dict(elo=0.22, form=0.16, mkt=0.62)
+#
+# The elo:form split was 60:40 and was never anything but a guess inherited
+# from the World Cup build. scripts/backtest.py now fits it properly, by
+# rebuilding the form signal the way the live pipeline evolves it — Elo-seeded
+# before MD1, then folded forward after each matchday by form_update.py's rule,
+# never using a result from the match being predicted or from its own matchday.
+# Swept 0.00 to 1.00 across both seasons, cross-validated:
+#
+#     w_form   0.00    0.05    0.20    0.40    0.60    0.80    1.00
+#     pts     0.762   0.788   0.743   0.743   0.762   0.730   0.733
+#     logloss 0.8979  0.8978  0.8995  0.9034  0.9099  0.9193  0.9325
+#
+# Read that honestly and it says form adds NOTHING. Log-loss is flat to four
+# decimals between 0.00 and 0.05 and then degrades monotonically — that part
+# is a clean, consistent signal, and it is a signal that this form component
+# makes the model worse. The points peak at 0.05 is not a signal: the entire
+# gain lives in one of the two seasons (0.841 against 0.788) while the other
+# does not move at all, and one extra exact score anywhere is worth 0.011.
+#
+# So why 0.05 and not 0.00? Only because the backtest cannot see the form
+# signal the live pipeline actually uses. Historically the cache can only
+# reconstruct form that was SEEDED FROM ELO, so measuring it against Elo is
+# close to asking whether Elo predicts itself. In season, xg_update.py rebuilds
+# team_form from real domestic expected goals, which carries information Elo
+# does not. 0.05 keeps that path alive at a weight the data cannot rule out.
+# It is a floor, not a finding: nothing here supports going back above it.
+W_NO_MKT = dict(elo=0.95, form=0.05, mkt=0.0)
+# The 0.62 market weight is still a judgement call — historical closing odds do
+# not exist at any price, so it is unfittable and untouched. What HAS been
+# carried over is the elo:form ratio, which was 58:42 of the non-market weight
+# and is now the fitted 95:5 of the same 0.38. Leaving form at 42% here while
+# the measurement put it at 5% would have been believing two things at once.
+W_MKT = dict(elo=0.36, form=0.02, mkt=0.62)
 
 
 def load_fixtures(con, round_id):
@@ -140,7 +210,29 @@ def venue_boost(is_home, round_id):
 # One parameter, not two, and deliberately so: ~44 historical second legs is
 # not enough data to identify separate chase and counter-attack effects. CHASE
 # is fitted in scripts/backtest.py; COUNTER_RATIO is held as a prior.
-CHASE = 0.11            # lift to the trailing side's xG, per goal of deficit
+#
+# It has now been fitted, and it came back ZERO. The cache holds 44 second
+# legs, 38 of them with a live aggregate to chase. Scoring them on scoreline
+# likelihood with COUNTER_RATIO pinned at 0.45, and sweeping CHASE from -0.10
+# to +0.30 (negative included deliberately — "a dead tie is played out quietly"
+# is as plausible a story as "a chase opens the game up"):
+#
+#     chase   -0.06   -0.02    0.00    0.02    0.10    0.20    0.30
+#     mean LL 3.2411  3.2309  3.2308  3.2336  3.2703  3.3637  3.5190
+#
+# The minimum sits at 0.00 and the surface is flat within about +/-0.05 of it —
+# but the two seasons' individual optima STRADDLE zero, one at +0.02 and one at
+# -0.06, which is what no signal looks like. The old 0.11 is not catastrophic,
+# merely unsupported: the second legs are about 5.7x more likely at 0.00 than
+# at 0.11, which is weak evidence, and it agrees with the points-per-match
+# check (0.788 against 0.754) without being independent of it.
+#
+# So this is "measured to zero", not "proven absent". The mechanism is real in
+# the sense that anyone who has watched a second leg has seen it; what the data
+# says is that 38 matches cannot find it, and that 0.11 was too big to keep on
+# a hunch. leg_tilt() and DEFICIT_CAP are left wired up precisely so that a
+# third cached season can revive this by changing one number.
+CHASE = 0.0             # lift to the trailing side's xG, per goal of deficit
 COUNTER_RATIO = 0.45    # share of that lift the leading side also gets
 DEFICIT_CAP = 3         # beyond three goals the tie is over and effort tails off
 
@@ -211,6 +303,24 @@ def market_lambdas(odds):
 
 
 def dc_tau(i, j, lh, la):
+    """Dixon-Coles low-score correction.
+
+    CEILING WARNING on RHO. The 0-0 cell is multiplied by (1 - lh*la*RHO), so
+    once RHO exceeds 1/(lh*la) that factor goes NEGATIVE, matrix() floors it at
+    zero, and the model starts claiming a 0-0 is impossible. Nothing raises an
+    error and outcome log-loss actually IMPROVES while it happens, because the
+    evicted mass lands on the favourite — an unbounded search in backtest.py
+    walked straight to rho=0.375 doing exactly this before it was constrained.
+    The bite is worst in EVENLY MATCHED ties, where lh*la is largest; a blowout
+    never comes close.
+
+    At the shipped RHO=0.23 the worst case across both cached seasons is
+    lh*la=2.96, leaving the 0-0 cell at 0.32 of its Poisson value. The ceiling
+    is 0.32, so there is room but not a lot. Anything that scales lambdas eats
+    that room — note that calibrate.py's goal_cal multiplies both, so a
+    goal_cal much above 1.04 combined with a raised RHO would cross it.
+    backtest.rho_ceiling() computes the bound for a given set of lambdas.
+    """
     if i == 0 and j == 0:
         return 1 - lh * la * RHO
     if i == 0 and j == 1:
@@ -275,8 +385,15 @@ def predict(home, away, data, exact_pts=3, dir_pts=1, round_id="md1", deficit=0,
 
 def build_data():
     elo, form, conf, cw, cal = load()
-    att_mean = sum(form[t][0] * cw[conf[t]] for t in form) / len(form)
-    dfn_mean = sum(form[t][1] / cw[conf[t]] for t in form) / len(form)
+    # Pre-draw the DB has no clubs at all, and CI runs the pipeline daily in
+    # that state. Neutral means keep the exact behaviour a caller would want:
+    # form_lambdas has nothing to say, so let it say "average" rather than
+    # letting a ZeroDivisionError take down the whole nightly job.
+    if form:
+        att_mean = sum(form[t][0] * cw[conf[t]] for t in form) / len(form)
+        dfn_mean = sum(form[t][1] / cw[conf[t]] for t in form) / len(form)
+    else:
+        att_mean = dfn_mean = 1.0
     con = sqlite3.connect(DB)
     market = load_market(con)
     con.close()
