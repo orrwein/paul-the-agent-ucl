@@ -53,6 +53,14 @@ CLUBELO_URL = "http://api.clubelo.com/{date}"
 FD_BASE = "https://api.football-data.org/v4"
 FD_COMPETITION = os.environ.get("PAUL_FD_COMPETITION", "CL")
 FD_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN")
+# The season is PINNED, never inherited from the feed's idea of "current".
+# Found the hard way: until football-data rolls its currentSeason over in
+# late August, an unpinned /teams or /matches call happily returns LAST
+# season's field — and the first dispatched nightly did exactly that,
+# ingesting the 2025/26 clubs as if they were the new draw. With the pin,
+# the same call before the draw returns nothing, which is the truthful
+# answer. football-data names a season by its starting year.
+FD_SEASON = os.environ.get("PAUL_FD_SEASON", "2026")
 ALIASES = os.path.join(ROOT, "data", "aliases.json")
 
 # the-odds-api. Free tier is 500 credits a month and one poll costs a credit
@@ -254,7 +262,20 @@ def fetch_clubelo(on=None):
 
 
 def ingest_elo(con, on=None):
-    snapshot = fetch_clubelo(on)
+    try:
+        snapshot = fetch_clubelo(on)
+    except SystemExit as e:
+        # ClubElo is a one-person free service and sometimes just doesn't
+        # answer, especially to datacenter IPs — the first dispatched nightly
+        # died this way. Ratings a day old are a rounding error next to a
+        # failed run, so if we HAVE ratings, keep them and carry on. An empty
+        # table stays a hard failure: silently modelling without any Elo is
+        # exactly the kind of quiet wrongness this pipeline refuses elsewhere.
+        have = con.execute("SELECT COUNT(*) FROM elo").fetchone()[0]
+        if have:
+            print(f"  !! ClubElo unreachable ({e}); keeping {have} stale ratings")
+            return 0
+        raise
     aliases = load_aliases()
     teams = [r[0] for r in con.execute("SELECT name FROM teams")]
     if not teams:
@@ -327,8 +348,27 @@ def round_for(match):
     return base
 
 
+def fd_get_season(path):
+    """fd_get, but a 404 means "this season isn't in the feed yet".
+
+    With the season pinned, football-data answers 404 for 2026/27 until UEFA
+    publishes the draw. That is the expected state every day until 27 August,
+    not an error: return None and let the caller no-op politely.
+    """
+    try:
+        return fd_get(path)
+    except SystemExit as e:
+        if "HTTP 404" in str(e):
+            return None
+        raise
+
+
 def ingest_teams(con):
-    data = fd_get(f"/competitions/{FD_COMPETITION}/teams")
+    data = fd_get_season(f"/competitions/{FD_COMPETITION}/teams?season={FD_SEASON}")
+    if data is None:
+        print(f"  teams: season {FD_SEASON}/{int(FD_SEASON)+1-2000} not in the "
+              f"feed yet (draw pending) — nothing to ingest")
+        return 0
     teams = data.get("teams", [])
     if not teams:
         print("  teams: feed returned none — has the draw happened?")
@@ -346,7 +386,11 @@ def ingest_teams(con):
 
 
 def ingest_fixtures(con):
-    data = fd_get(f"/competitions/{FD_COMPETITION}/matches")
+    data = fd_get_season(f"/competitions/{FD_COMPETITION}/matches?season={FD_SEASON}")
+    if data is None:
+        print(f"  fixtures: season {FD_SEASON}/{int(FD_SEASON)+1-2000} not in the "
+              f"feed yet (draw pending) — nothing to ingest")
+        return 0
     matches = data.get("matches", [])
     known = {r[0] for r in con.execute("SELECT name FROM teams")}
     aliases = load_aliases()
@@ -385,7 +429,11 @@ def _is_second_leg(con, rid, home, away):
 
 
 def ingest_results(con):
-    data = fd_get(f"/competitions/{FD_COMPETITION}/matches?status=FINISHED")
+    data = fd_get_season(f"/competitions/{FD_COMPETITION}/matches?season={FD_SEASON}&status=FINISHED")
+    if data is None:
+        print(f"  results: season {FD_SEASON}/{int(FD_SEASON)+1-2000} not in the "
+              f"feed yet (draw pending) — nothing to ingest")
+        return 0
     known = {r[0] for r in con.execute("SELECT name FROM teams")}
     aliases = load_aliases()
     wrote = 0
@@ -488,7 +536,11 @@ def ingest_odds(con):
 
 
 def ingest_scorers(con, limit=20):
-    data = fd_get(f"/competitions/{FD_COMPETITION}/scorers?limit={limit}")
+    data = fd_get_season(f"/competitions/{FD_COMPETITION}/scorers?season={FD_SEASON}&limit={limit}")
+    if data is None:
+        print(f"  scorers: season {FD_SEASON}/{int(FD_SEASON)+1-2000} not in the "
+              f"feed yet (draw pending) — nothing to ingest")
+        return 0
     now = datetime.now(timezone.utc).isoformat()
     scorers = data.get("scorers", [])
     for s in scorers:
