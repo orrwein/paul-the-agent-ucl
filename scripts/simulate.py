@@ -73,6 +73,13 @@ ELO_SIGMA = float(os.environ.get("PAUL_ELO_SIGMA", 40))
 # simulator expects give a slope of 0.87 and 0.92. Below 1 means the favourites
 # are being spread too far from the field.
 #
+# RETIRED TO 1.0 (off) after the ensemble refit. The 0.90 shrink was fitted
+# against the old constants (form weight 0.40, BASE_TOTAL 3.42); the refit
+# flattened the model at the source and the two corrections then stacked —
+# slopes moved to 1.04/1.18, i.e. over-shrunk. At 1.0 the slopes read
+# 0.99/1.09. One knob per disease: the tilt is B's to fix, not this one's.
+# The env var stays as an experiment lever.
+#
 # The reason it does not contradict the per-match fit: model.predict is scored
 # against the rating a club held THAT WEEK, so it follows a club sliding down
 # the table. The simulator freezes September's rating for nine months and so
@@ -81,7 +88,7 @@ ELO_SIGMA = float(os.environ.get("PAUL_ELO_SIGMA", 40))
 #
 # This belongs to season projection only. For one upcoming match today's rating
 # is the best estimate available, so model.predict is deliberately untouched.
-ELO_SHRINK = float(os.environ.get("PAUL_ELO_SHRINK", 0.90))
+ELO_SHRINK = float(os.environ.get("PAUL_ELO_SHRINK", 1.00))
 
 # Perturbations are bucketed before they hit the sampler cache, since building
 # a scoreline matrix per club-pair per continuous draw would be ruinous. 25
