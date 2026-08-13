@@ -380,8 +380,15 @@ def form_lambdas(form, cw, att_mean, dfn_mean, home, away, p, neutral):
         return (form[t][0] * cw[t]) / att_mean
     def leak(t):
         return (form[t][1] / cw[t]) / dfn_mean
+    # total-preserving tilt — must mirror model.form_lambdas exactly, or the
+    # weight this file fits is fitted against a model we do not ship
     lift = 1.0 + (0.0 if neutral else p["home_elo"]) / 500.0
-    return mu * att(home) * leak(away) * lift, mu * att(away) * leak(home)
+    lh = mu * att(home) * leak(away)
+    la = mu * att(away) * leak(home)
+    total = lh + la
+    lh *= lift
+    scale = total / (lh + la) if (lh + la) > 0 else 1.0
+    return lh * scale, la * scale
 
 
 def clamp_ratio(x):

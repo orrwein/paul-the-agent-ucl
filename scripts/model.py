@@ -275,9 +275,20 @@ def form_lambdas(form, conf, cw, att_mean, dfn_mean, home, away, round_id="md1")
         return (form[t][1] / cw[conf[t]]) / dfn_mean
     # Home lift on attacking output. Scaled off the same Elo-denominated home
     # advantage so there is one dial to fit, not two.
+    # The lift redistributes the total between the sides; it does not create
+    # goals. Applying it to the home lambda alone (as this did) manufactured
+    # them: at full form weight the model predicted 3.65 goals a game against
+    # an observed 3.35. The Elo path never had the bug because it splits
+    # supremacy additively (BASE_TOTAL/2 +/- sup/2), which is total-preserving
+    # by construction. This is the multiplicative equivalent — tilt, then
+    # renormalise back to the total the two form lines implied.
     lift = 1.0 + T.venue_elo(round_id) / 500.0
-    return (MU * att(home) * leak(away) * lift,
-            MU * att(away) * leak(home))
+    lh = MU * att(home) * leak(away)
+    la = MU * att(away) * leak(home)
+    total = lh + la
+    lh *= lift
+    scale = total / (lh + la) if (lh + la) > 0 else 1.0
+    return lh * scale, la * scale
 
 
 # ---- signal 3: market 1X2 -> lambdas (grid search match to implied probs) ----
