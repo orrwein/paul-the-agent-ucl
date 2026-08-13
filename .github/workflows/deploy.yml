@@ -1,3 +1,18 @@
+# Deploy on a human push to main.
+#
+# This covers exactly one case: someone commits and pushes by hand (a locked
+# round from scripts/round.py, a weekly scripts/xg_update.py run, a site tweak).
+# It regenerates docs/data.json from the committed database and publishes.
+#
+# It does NOT cover the nightly data refresh. That workflow commits with the
+# default GITHUB_TOKEN, and GitHub does not raise workflow triggers for such
+# pushes — so this file would never see them. nightly.yml therefore runs its own
+# deploy job at the end instead of relying on this one. Keep both: they handle
+# different triggers, and neither is redundant.
+#
+# Safe before the league-phase draw: export_site.py detects the empty database
+# and emits a "pre_draw" payload rather than failing.
+
 name: Deploy Paul the Agent to GitHub Pages
 
 on:

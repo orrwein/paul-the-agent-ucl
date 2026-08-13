@@ -1,0 +1,97 @@
+# Fast pre-merge check: does the pipeline still run end to end?
+#
+# The real database (data/ucl2627.db) is empty until the league-phase draw on
+# 27 Aug 2026, so it cannot prove anything about the model code. Instead this
+# builds a throwaway database, seeds a synthetic-but-complete season into it
+# (.github/smoke/seed.py), and runs the offline pipeline over that.
+#
+# Constraints this respects:
+#   * stdlib only — the pipeline has no third-party dependencies, so there is
+#     no install step and nothing to cache.
+#   * no secrets — everything runs with --offline, so no feed is touched.
+#   * under a minute — PAUL_SIMS drops the Monte Carlo from 20,000 runs to 200.
+#     The smoke check is asking "does simulate.py run", not "is it accurate".
+#   * never touches data/ucl2627.db — PAUL_DB points at a scratch file.
+
+name: CI check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      PAUL_DB: ${{ github.workspace }}/smoke.db
+      PAUL_SIMS: "200"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Byte-compile every script
+        run: python -m compileall -q scripts
+
+      - name: Initialise a scratch database
+        run: python3 scripts/init_db.py
+
+      - name: Seed a synthetic season
+        run: python3 .github/smoke/seed.py
+
+      - name: Run the offline pipeline
+        # calibrate -> form -> momentum -> simulate -> export_site.
+        # --offline skips the network ingest, so no token is needed.
+        run: python3 scripts/update.py --offline
+
+      - name: Export the site payload and validate it
+        run: |
+          # Remove the committed payload first, so the assertion below cannot
+          # pass by reading a stale file that export_site.py never rewrote.
+          rm -f docs/data.json
+          python3 scripts/export_site.py
+          python3 - <<'PY'
+          import json, sys
+          with open("docs/data.json") as f:
+              d = json.load(f)
+          # A deliberately small core: the keys docs/app.js cannot render
+          # without. Asserting the whole payload shape here would turn every
+          # site tweak into a CI failure.
+          required = {"generated_at", "summary", "rounds", "table", "teams",
+                      "bracket", "futures", "title_race", "top_scorer"}
+          missing = required - set(d)
+          if missing:
+              sys.exit(f"docs/data.json is missing keys: {sorted(missing)}")
+          if len(d["table"]) != 36:
+              sys.exit(f"expected 36 clubs in the league table, got {len(d['table'])}")
+          if not d["rounds"]:
+              sys.exit("docs/data.json has no rounds")
+          graded = d["summary"].get("graded", 0)
+          if not graded:
+              sys.exit("nothing was graded — the seeded results never reached the export")
+          print(f"docs/data.json OK: {graded} graded, "
+                f"{len(d['table'])} table rows, {len(d['rounds'])} rounds")
+          PY
+
+      - name: Confirm the scratch database was used
+        # A regression that ignored PAUL_DB would quietly run the whole check
+        # against the real season database. Catch that here rather than in a
+        # confusing diff later.
+        if: always()
+        run: |
+          test -f "$PAUL_DB" || { echo "::error::scratch DB missing — PAUL_DB was ignored"; exit 1; }
+          git diff --quiet -- data/ucl2627.db || { echo "::error::the real database was modified by the smoke run"; exit 1; }

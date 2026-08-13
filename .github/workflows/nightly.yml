@@ -1,0 +1,246 @@
+# Nightly data refresh.
+#
+# Pulls results, scorers and club ratings from the live feeds, re-runs the
+# model, regenerates docs/data.json, commits whatever changed, and deploys the
+# site. This is the only workflow that writes to the repository.
+#
+# What it deliberately does NOT do:
+#   * scripts/round.py — locking a pick is a manual, deliberate act. A pick must
+#     never appear as a side effect of a refresh.
+#   * futures locking — same reasoning, and it happens once per season anyway.
+#   * scripts/xg_update.py — needs the optional `soccerdata` package and reaches
+#     Understat through a TLS shim. LAUNCH.md documents why it stays a manual
+#     weekly step; it is not a CI dependency.
+#
+# Odds credit budget (the-odds-api free tier = 500 credits/month):
+#   One --odds call costs ~1 credit per region per market. We poll one region
+#   (eu) and one market, so ~1 credit per call. Polling every night would cost
+#   ~30 credits/month — affordable outright. We still don't, because prices only
+#   matter near kickoff: the "decide whether to pull odds" step below fires only
+#   when a fixture starts within the next 48h. Over a season that is roughly 8
+#   league matchdays plus 5 knockout rounds x ~3 nights = comfortably under 60
+#   credits. Before the draw there are no fixtures, so it spends nothing at all.
+
+name: Nightly data refresh
+
+on:
+  schedule:
+    # 05:00 UTC daily — after any European evening kickoff has finished and
+    # football-data has settled the result, before European morning traffic.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      force_odds:
+        description: "Pull bookmaker odds even outside a matchday window (~1 credit)"
+        type: boolean
+        default: false
+
+concurrency:
+  # The refresh gets its own group, NOT the shared "pages" group. deploy.yml
+  # sets cancel-in-progress on that group, so sharing it would let a routine
+  # push to main cancel a nightly midway through its data refresh. Only the
+  # deploy job below joins the pages group.
+  group: nightly-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write        # commits the updated DB and data.json
+    outputs:
+      go: ${{ steps.ready.outputs.go }}
+
+    env:
+      FOOTBALL_DATA_TOKEN: ${{ secrets.FOOTBALL_DATA_TOKEN }}
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The pipeline is stdlib-only by design, so there is nothing to install.
+
+      - name: Check required secrets
+        run: |
+          if [ -z "$FOOTBALL_DATA_TOKEN" ]; then
+            echo "::error::FOOTBALL_DATA_TOKEN is not set. Run: gh secret set FOOTBALL_DATA_TOKEN"
+            exit 1
+          fi
+          if [ -z "$ODDS_API_KEY" ]; then
+            echo "::notice::ODDS_API_KEY not set — odds ingestion will be skipped."
+          fi
+
+      # ---------------------------------------------------------------------
+      # Pre-draw bootstrap.
+      #
+      # The league-phase draw is 27 Aug 2026. Until it happens the database has
+      # no teams and no fixtures, and the model steps cannot run — calibrate.py
+      # raises ZeroDivisionError on an empty club list, and simulate.py exits
+      # non-zero without league fixtures. So: look first, and if the draw has
+      # landed, pull the field before anything else. That makes the morning
+      # after the draw self-starting rather than a manual chore.
+      # ---------------------------------------------------------------------
+      - name: Inspect database state
+        id: state
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import sqlite3
+          con = sqlite3.connect("data/ucl2627.db")
+          n = lambda t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+          print(f"teams={n('teams')}")
+          print(f"fixtures={n('fixtures')}")
+          PY
+
+      - name: Pull the field (draw not yet ingested)
+        if: steps.state.outputs.teams == '0' || steps.state.outputs.fixtures == '0'
+        # Tolerant on purpose: before the draw this call has nothing to return,
+        # and a quiet no-op is the correct outcome. A genuine feed outage also
+        # lands here, which is why the summary step reports what happened.
+        continue-on-error: true
+        run: python3 scripts/ingest.py --teams --fixtures --elo
+
+      - name: Seed starting form from Elo (first ingest only)
+        # Separate from the step above, and gated on teams==0 rather than "either
+        # is empty": --seed-form rewrites every club's form line from its Elo.
+        # That is exactly right once, at the draw, and destructive afterwards —
+        # it would erase a season of accumulated form.
+        if: steps.state.outputs.teams == '0'
+        continue-on-error: true
+        run: python3 scripts/ingest.py --seed-form
+
+      - name: Re-inspect database state
+        id: ready
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import sqlite3
+          con = sqlite3.connect("data/ucl2627.db")
+          n = lambda t: con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+          teams, fixtures = n("teams"), n("fixtures")
+          print(f"teams={teams}")
+          print(f"fixtures={fixtures}")
+          print(f"go={'true' if teams and fixtures else 'false'}")
+          PY
+
+      - name: Waiting for the league-phase draw
+        if: steps.ready.outputs.go != 'true'
+        run: echo "::notice::No teams/fixtures yet (draw is 27 Aug 2026) — skipping the model pipeline. Expected, not a failure."
+
+      # ---------------------------------------------------------------------
+      # Odds: only near kickoff. See the credit budget note at the top.
+      # ---------------------------------------------------------------------
+      - name: Decide whether to pull odds
+        id: odds
+        if: steps.ready.outputs.go == 'true'
+        env:
+          FORCE_ODDS: ${{ inputs.force_odds }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, sqlite3
+          from datetime import datetime, timedelta, timezone
+          con = sqlite3.connect("data/ucl2627.db")
+          now = datetime.now(timezone.utc)
+          horizon = now + timedelta(hours=48)
+          soon = 0
+          for (ko,) in con.execute(
+                  "SELECT kickoff FROM fixtures WHERE kickoff IS NOT NULL"):
+              try:
+                  t = datetime.fromisoformat(ko.replace("Z", "+00:00"))
+              except ValueError:
+                  continue
+              if t.tzinfo is None:
+                  t = t.replace(tzinfo=timezone.utc)
+              if now <= t <= horizon:
+                  soon += 1
+          forced = os.environ.get("FORCE_ODDS") == "true"
+          have_key = bool(os.environ.get("ODDS_API_KEY"))
+          print(f"pull={'true' if have_key and (forced or soon) else 'false'}")
+          print(f"upcoming={soon}")
+          PY
+
+      - name: Ingest bookmaker odds
+        if: steps.odds.outputs.pull == 'true'
+        # Runs BEFORE update.py so the fresh prices feed calibrate / simulate /
+        # export in the same run. update.py's own ingest step covers
+        # --results --scorers --elo only; it never pulls --odds.
+        run: python3 scripts/ingest.py --odds
+
+      - name: Refresh data and rebuild the site
+        if: steps.ready.outputs.go == 'true'
+        # update.py = ingest(results, scorers, elo) -> calibrate -> form ->
+        # momentum -> simulate -> export_site. Network on: no --offline here.
+        run: python3 scripts/update.py
+
+      # ---------------------------------------------------------------------
+      # Commit only if something actually moved.
+      # ---------------------------------------------------------------------
+      - name: Commit refreshed data
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data docs
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing changed — no commit."
+          else
+            # Plain, obviously-automated message. Claude-authored commits carry a
+            # Co-Authored-By trailer; a machine refresh should not pretend to.
+            git commit -m "Nightly data refresh"
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Pages artifact
+        if: steps.ready.outputs.go == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Nightly refresh"
+            echo ""
+            echo "- clubs in DB: ${{ steps.ready.outputs.teams }}"
+            echo "- fixtures in DB: ${{ steps.ready.outputs.fixtures }}"
+            echo "- pipeline ran: ${{ steps.ready.outputs.go }}"
+            echo "- odds pulled: ${{ steps.odds.outputs.pull || 'false' }} (fixtures within 48h: ${{ steps.odds.outputs.upcoming || 0 }})"
+            echo "- committed: ${{ steps.commit.outputs.changed }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------------
+  # Deploy from this workflow rather than letting the commit above trigger
+  # deploy.yml.
+  #
+  # A push made with the default GITHUB_TOKEN does not trigger other workflows —
+  # GitHub blocks that to stop runs recursing. The documented workarounds are a
+  # personal access token or a GitHub App, both of which mean minting and
+  # rotating another credential. Deploying inline needs no extra secret and is
+  # one hop shorter. deploy.yml still handles the ordinary case: a human pushing
+  # to main.
+  # -------------------------------------------------------------------------
+  deploy:
+    needs: refresh
+    if: needs.refresh.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      # Only this job joins the shared group, so a push-triggered deploy can
+      # supersede a queued nightly deploy without touching the refresh above.
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

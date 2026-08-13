@@ -74,8 +74,66 @@ python3 scripts/update.py
 Run any script with `-h`/no args for full usage and examples.
 
 Commit and push — the GitHub Actions workflow (`.github/workflows/deploy.yml`)
-regenerates `docs/data.json` from `data/wc2026.db` and deploys to GitHub Pages
+regenerates `docs/data.json` from `data/ucl2627.db` and deploys to GitHub Pages
 automatically.
+
+## Operations
+
+### What runs automatically
+
+| Workflow | Trigger | What it does |
+|----------|---------|--------------|
+| `.github/workflows/nightly.yml` | 05:00 UTC daily, or manual | Pulls results, scorers and Elo, re-runs the model, regenerates `docs/data.json`, commits any change as "Nightly data refresh", then deploys. |
+| `.github/workflows/check.yml` | every push and PR | Byte-compiles `scripts/`, then seeds a throwaway database with a synthetic 36-club season and runs the whole offline pipeline over it. No secrets, ~15 seconds. |
+| `.github/workflows/deploy.yml` | push to `main` | Rebuilds `docs/data.json` and publishes to Pages. |
+
+Two details worth knowing about the nightly job:
+
+- **Before the league-phase draw** (27 Aug 2026) it checks the database, finds
+  no clubs, and skips the model steps with a notice instead of failing —
+  `calibrate.py` cannot run on an empty field. The morning after the draw it
+  ingests teams and fixtures on its own and starts running for real.
+- **Odds are not pulled every night.** It spends an the-odds-api credit only
+  when a fixture kicks off within the next 48 hours, which works out to well
+  under 60 of the 500 monthly credits across a season. Use the workflow's
+  `force_odds` input to override that for a one-off manual run.
+
+### What stays manual
+
+Automating these would be wrong, not merely unnecessary:
+
+```bash
+python3 scripts/round.py md1        # lock a round's picks — before kickoff
+python3 scripts/futures.py          # champion + golden boot — once, pre-season
+python3 scripts/xg_update.py        # expected-goals refresh — weekly
+```
+
+`round.py` and `futures.py` are the only scripts that write a bet, and a pick
+must never appear as a side effect of a scheduled refresh — the whole premise is
+that predictions are locked before the match, on purpose, by a human. CI never
+runs either one. `xg_update.py` stays manual for a different reason: it needs
+the optional `soccerdata` package and reaches Understat through a TLS shim, so
+it is deliberately outside the stdlib-only pipeline (see `LAUNCH.md`).
+
+Recording results (`result.py`, `goals.py`) is also manual, since it is the
+input the nightly job builds on.
+
+### One-time setup
+
+The pipeline reads its keys from the environment, so CI needs them as repository
+secrets — no `.env` file is involved:
+
+```bash
+gh secret set FOOTBALL_DATA_TOKEN   # required: fixtures, results, scorers
+gh secret set ODDS_API_KEY          # optional: bookmaker 1X2 consensus
+```
+
+Without `FOOTBALL_DATA_TOKEN` the nightly job fails fast with a clear error.
+Without `ODDS_API_KEY` it simply skips the odds step.
+
+GitHub Pages must be enabled with **Settings → Pages → Source: GitHub Actions**
+(not "Deploy from a branch"). On a fresh fork, Actions also needs enabling once
+under the repository's Actions tab before any scheduled run will fire.
 
 ## Local preview
 
