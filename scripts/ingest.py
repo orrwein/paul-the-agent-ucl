@@ -499,7 +499,10 @@ def ingest_scorers(con, limit=20):
         con.execute(
             "INSERT OR REPLACE INTO ts_live "
             "(player, club, goals, penalty_taker, updated_at) VALUES (?,?,?,?,?)",
-            (player, club, goals, 1 if pens else 0, now))
+            # >=2 converted penalties before the taker flag: at >=1, half the
+            # midfielders in the field would collect a striker's penalty bonus
+            # in topscorer.py's projection (same threshold as its --seed path).
+            (player, club, goals, 1 if (pens or 0) >= 2 else 0, now))
     played = con.execute("SELECT COUNT(*) FROM match_results").fetchone()[0]
     con.execute(
         "INSERT OR REPLACE INTO ts_meta (id, games_played, as_of, source) "
