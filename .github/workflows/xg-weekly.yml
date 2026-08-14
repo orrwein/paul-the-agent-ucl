@@ -1,0 +1,83 @@
+# Weekly expected-goals refresh.
+#
+# Why this is its own workflow and not a step in nightly.yml:
+#
+#   * It is the ONLY thing in the project needing a third-party package
+#     (soccerdata). nightly.yml installs nothing, and that is worth keeping —
+#     a dependency resolution failure must not be able to stop the daily
+#     results-and-simulate run.
+#   * The signal it refreshes moves on a scale of weeks, not days. A club's
+#     20-match rolling xG barely shifts between Tuesday and Wednesday.
+#   * It reaches Understat through a TLS-fingerprint shim, because the site
+#     sits behind bot protection. Weekly and low-volume is a materially
+#     smaller ask than nightly, and it is one fetch of five league schedules.
+#
+# It runs Monday, after the weekend's domestic fixtures have settled and
+# before the midweek European round — the point in the week when a refreshed
+# form line has the most chance of changing a pick.
+#
+# If Understat blocks GitHub's datacenter IPs this job will fail and the
+# fallback is a local scheduled run; see README "Operations".
+
+name: Weekly xG refresh
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: xg-weekly
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the optional xG dependency
+        run: pip install -r requirements.txt
+
+      - name: Check the field is drawn
+        id: state
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import sqlite3
+          con = sqlite3.connect("data/ucl2627.db")
+          n = con.execute("SELECT COUNT(*) FROM teams").fetchone()[0]
+          print(f"teams={n}")
+          PY
+
+      - name: Refresh team form from expected goals
+        if: steps.state.outputs.teams != '0'
+        run: python3 scripts/xg_update.py --seasons 2026-2027
+
+      - name: Rebuild the site payload
+        if: steps.state.outputs.teams != '0'
+        run: python3 scripts/export_site.py
+
+      - name: Commit if anything moved
+        if: steps.state.outputs.teams != '0'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ucl2627.db docs/data.json
+          if git diff --cached --quiet; then
+            echo "::notice::No change in form this week."
+          else
+            git commit -m "Weekly xG refresh"
+            git push
+          fi
+
+      - name: Waiting for the draw
+        if: steps.state.outputs.teams == '0'
+        run: echo "::notice::No teams yet (draw is 27 Aug 2026) — nothing to refresh."

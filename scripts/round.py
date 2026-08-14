@@ -163,6 +163,9 @@ def main():
                     help="re-model fixtures that have not been played yet")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the card without writing anything")
+    ap.add_argument("--allow-no-odds", action="store_true",
+                    help="lock even where no bookmaker price is available "
+                         "(last resort — see the docstring)")
     args = ap.parse_args()
 
     rnd = T.get_round(args.round_id)
@@ -190,6 +193,34 @@ def main():
           f"{'  |  two legs, aggregate' if rnd.legs == 2 else ''}")
     print(f"{'Match':46} {'PICK':7} {'Winner':22} {'Conf':>6}  {'src':12} status")
     print("-" * 108)
+
+    # A pick made without a market price is a worse pick, and we do not have to
+    # make one: match bets are changeable right up to kickoff, so the right move
+    # when odds are missing is to WAIT, not to guess and hope a refresh catches
+    # it. Bookmaker prices carry 62% of the blend, and they absorb team news,
+    # lineups and late money that no feed of ours will ever see.
+    #
+    # This is a hard stop rather than a warning because a warning scrolls past.
+    # --allow-no-odds exists for the genuine last resort: a deadline arriving
+    # with no price on the board. If that happens, the pick is still made, and
+    # bet_history records used_mkt=0 so the graded record shows which picks were
+    # taken blind.
+    unpriced = [f for f in fixtures
+                if f not in played and not M.has_market(data, *f)]
+    if unpriced and not args.allow_no_odds:
+        print(f"\n{len(unpriced)} of {len(fixtures)} fixtures have no bookmaker "
+              f"price yet:")
+        for h, a in unpriced[:8]:
+            print(f"    {h} v {a}")
+        if len(unpriced) > 8:
+            print(f"    ... and {len(unpriced) - 8} more")
+        raise SystemExit(
+            "\nRefusing to lock without the market signal.\n"
+            "  Pull prices:      python3 scripts/ingest.py --odds\n"
+            "  Then re-run this command.\n"
+            "  Genuinely no price available and the deadline is here?\n"
+            "                    python3 scripts/round.py "
+            f"{rnd.id} --allow-no-odds")
 
     wrote = skipped = revised = 0
     for home, away in fixtures:

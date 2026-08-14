@@ -214,6 +214,16 @@ def load_fixtures(con, round_id):
         (round_id,))]
 
 
+def has_market(data, home, away):
+    """Is there a bookmaker price for this fixture?
+
+    Callers use this to decide whether a pick can honestly be made at all —
+    see scripts/round.py, which refuses to lock without one. Kept here beside
+    load_market so the lookup and the storage shape stay in one place.
+    """
+    return (home, away) in data[7]
+
+
 def load_market(con):
     """(home, away) -> (oh, od, oa) decimal 1X2, for whatever we have prices on."""
     return {(h, a): (oh, od, oa) for h, a, oh, od, oa in con.execute(
