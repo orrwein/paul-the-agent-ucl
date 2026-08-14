@@ -162,6 +162,42 @@ MU = BASE_TOTAL / 2       # avg goals per team for form component (was 1.33)
 # Elo is close to a no-op. A coverage-dependent weight was fitted for exactly
 # that reason and rejected: at its best it beat the best single weight by
 # 0.0008 nats, which does not pay for making predict() coverage-aware.
+#
+# THE WIDER FEED THAT DOES NOT FIX IT. The repair for a degenerate rescale is
+# not a cleverer rescale, it is real data, and there is some to be had for
+# free: football-data's tier — already authorised, already rate-limited for, no
+# scraper and no extra dependency — carries two of the missing leagues, the
+# Eredivisie and the Primeira Liga, in GOALS. That is four clubs a season (PSV,
+# Ajax or Feyenoord, Benfica, Sporting) and 81 of the 378 cached matches. Only
+# THREE have such a club on each side, so there is no clean both-covered arm
+# for them and there never will be; the honest test is the paired swap below.
+#
+# backtest.py arm E ships the deployed hybrid with exactly those clubs on
+# measured domestic goals rather than the Elo rescale, everything else held.
+# The substitution is real, not cosmetic — Sporting's mid-January line moves
+# from 1.85/1.27 rescaled to 2.65/0.50 measured, and the league weights refitted
+# on the wider pool price the two leagues at 0.82/0.83 against the 0.96/0.98
+# guessed in tournament.LEAGUE_WEIGHT. It still buys nothing:
+#
+#     swapping the rescale for measured goals       nats       95% CI
+#     the 81 NED/POR matches, w_form=0.30         -0.0044   [-0.0215,+0.0127]
+#     the same 81 at w_form=0.79                  +0.0079   [-0.0394,+0.0557]
+#     all 378 matches, w_form=0.30                -0.0009   [-0.0049,+0.0032]
+#
+# and on the instrument that priced the weight in the first place it points the
+# WRONG WAY: the hybrid's implied w_form falls from 0.50 [0.24,0.63] to 0.42
+# [0.17,0.55] and the form t from +2.84 to +2.78, both over all 378 at window
+# 20. Restricted to the 81, the form term reaches t=+0.83 at its best window
+# and is never significant. The -0.0026 bar is nominally cleared on the 81
+# matches and the confidence interval is five times the effect.
+#
+# This is the arm C0 result again — goals carry much less than xG — arriving in
+# the setting that was supposed to be easy for them, where the incumbent is a
+# restatement of Elo rather than real xG. Four clubs a season is too small a
+# patch for a signal that weak, and the field means every club is normalised
+# against shift underneath it. So the live path is UNCHANGED: xg_update.py
+# still rescales every non-big-five club from Elo. What would move this is xG
+# for those leagues, not more goals from them.
 W_NO_MKT = dict(elo=0.70, form=0.30, mkt=0.0)
 # The 0.62 market weight is still a judgement call — historical closing odds do
 # not exist at any price, so it is unfittable and untouched. What HAS been

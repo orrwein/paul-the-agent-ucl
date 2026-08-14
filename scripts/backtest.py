@@ -52,6 +52,12 @@ What it fits
    as well, the soccerdata dependency buys nothing. Graded on points and
    log-loss, and then on an incremental regression that can actually resolve
    the effect, which neither of the first two can at n=378.
+2c. Arms E, E+ and B+: can a WIDER free feed replace the Elo rescale for the
+   clubs Understat cannot see? football-data covers two of the missing leagues
+   (Eredivisie, Primeira Liga) in goals. Arm E is the whole field with those
+   clubs measured instead of rescaled; E+ and B+ are the same two models on
+   just the 81 matches a Dutch or Portuguese club plays in, which is the only
+   place the change can show. Measured and rejected — see model.py's W_NO_MKT.
 3. CHASE, the second-leg tilt, on the ~44 second legs in the cache.
 4. RHO twice over: once on outcome log-loss (what the old fit optimised) and
    once on full scoreline likelihood (what the exact-score bonus is paid on).
@@ -553,11 +559,15 @@ _FIELD = {}
 _LW = {}
 
 
+SOURCES = {"xg": XH.xg_series,          # Understat, big five, expected goals
+           "goals": XH.goals_series,    # football-data, big five, actual goals
+           "wide": XH.wide_series}      # xG big five + NED/POR actual goals
+
+
 def series(source):
-    """xg_history.Series for "xg" (Understat) or "goals" (football-data)."""
+    """xg_history.Series for one of SOURCES."""
     if source not in _SERIES:
-        rows = XH.xg_series() if source == "xg" else XH.goals_series()
-        _SERIES[source] = XH.Series(rows)
+        _SERIES[source] = XH.Series(SOURCES[source]())
     return _SERIES[source]
 
 
@@ -661,6 +671,56 @@ def both_covered(rows, source, window):
     return out
 
 
+def newly_covered(rows, source, base, window):
+    """Per row: does EITHER club gain a real form line by moving base -> source?
+
+    The question a wider feed has to answer is not "is this source good" but
+    "does it beat the thing it replaces, on the matches where it replaces it".
+    Under `base` those clubs get a line regressed from their own Elo; under
+    `source` they get a measured one. Every other match in the season is
+    affected only second-hand, through the field means, so pooling them in
+    would dilute the effect with matches that cannot show it.
+    """
+    if not rows:
+        return []
+    season = rows[0].season
+    groups = defaultdict(list)
+    for i, r in enumerate(rows):
+        groups[(r.rid, r.leg)].append(i)
+    out = [False] * len(rows)
+    for idxs in groups.values():
+        cutoff = min(rows[i].date for i in idxs)
+        _f, _c, have = domestic_field(season, source, window, cutoff, False)
+        _f, _c, had = domestic_field(season, base, window, cutoff, False)
+        gained = have - had
+        for i in idxs:
+            out[i] = rows[i].home in gained or rows[i].away in gained
+    return out
+
+
+def select_mask(rows, source, window, both, valid, select, gained=None):
+    """Which rows an arm is graded on. One place, so every caller agrees.
+
+    "both" — each club has a real measured line (the clean, small-n arm).
+    "all"  — every match, which is what the deployed hybrid predicts.
+    "rest" — the complement of "both": the matches carried by the Elo rescale.
+    "new"  — the matches a WIDER feed adds real coverage to. `gained` is the
+             pair (wider source, source it replaces), and it is passed
+             explicitly rather than derived from `source` precisely so that the
+             narrow arm can be graded on the wide arm's matches. Both sides of
+             a head-to-head have to be scored on one fixed set of fixtures or
+             the difference between them is partly a difference of samples.
+    """
+    if select == "both":
+        return list(both)
+    if select == "rest":
+        return [v and not b for v, b in zip(valid, both)]
+    if select == "new":
+        return [v and n for v, n in
+                zip(valid, newly_covered(rows, gained[0], gained[1], window))]
+    return list(valid)
+
+
 def domestic_lambdas(rows, p, w_form, source, window, hybrid):
     """Blended (lh, la) per row, plus per-row coverage flags.
 
@@ -717,7 +777,7 @@ def domestic_lambdas(rows, p, w_form, source, window, hybrid):
 
 
 def sweep_domestic(by_season, backbone, weights, source, window, hybrid,
-                   select="both", align=None):
+                   select="both", align=None, gained=None):
     """sweep_form's counterpart for domestic form. Same folds, same objective.
 
     `select` picks which matches are graded: "both" (only pairs where each club
@@ -739,12 +799,7 @@ def sweep_domestic(by_season, backbone, weights, source, window, hybrid,
             p = dict(backbone[fit_s], w_form=w, league_weights=False)
             rows = by_season[grade_s]
             lam, both, valid = domestic_lambdas(rows, p, w, source, window, hybrid)
-            if select == "both":
-                mask = both
-            elif select == "rest":
-                mask = [v and not b for v, b in zip(valid, both)]
-            else:
-                mask = valid
+            mask = select_mask(rows, source, window, both, valid, select, gained)
             if align:
                 mask = [m and a for m, a in
                         zip(mask, both_covered(rows, align, window))]
@@ -797,7 +852,7 @@ def pts_series(rows, p, lam, rules=None):
     return out
 
 
-def incremental_test(by_season, source, window, hybrid, select, p):
+def incremental_test(by_season, source, window, hybrid, select, p, gained=None):
     """Does form-implied supremacy explain goal difference BEYOND Elo's?
 
     The paired log-loss test above compares two complete models, and most of
@@ -818,7 +873,7 @@ def incremental_test(by_season, source, window, hybrid, select, p):
     for season, rows in by_season.items():
         lam1, both, valid = domestic_lambdas(rows, p, 1.0, source, window, hybrid)
         lam0, _b, _v = domestic_lambdas(rows, p, 0.0, source, window, hybrid)
-        mask = both if select == "both" else valid
+        mask = select_mask(rows, source, window, both, valid, select, gained)
         for i, r in enumerate(rows):
             if not mask[i]:
                 continue
@@ -865,7 +920,8 @@ def incremental_test(by_season, source, window, hybrid, select, p):
                 w=w_imp, w_lo=max(0.0, w_lo), w_hi=min(1.0, w_hi))
 
 
-def paired_ll(by_season, backbone, source, window, hybrid, select, w_a, w_b):
+def paired_ll(by_season, backbone, source, window, hybrid, select, w_a, w_b,
+              gained=None):
     """Per-match log-loss differences (at w_b minus at w_a), pooled over folds."""
     diffs = []
     for fit_s, grade_s in fold_pairs(by_season):
@@ -874,7 +930,34 @@ def paired_ll(by_season, backbone, source, window, hybrid, select, w_a, w_b):
         for w in (w_a, w_b):
             p = dict(backbone[fit_s], w_form=w, league_weights=False)
             lam, both, valid = domestic_lambdas(rows, p, w, source, window, hybrid)
-            mask = both if select == "both" else valid
+            mask = select_mask(rows, source, window, both, valid, select, gained)
+            gr = [r for r, m in zip(rows, mask) if m]
+            gl = [l for l, m in zip(lam, mask) if m]
+            got.append(ll_series(gr, capped(p, gr, gl), gl))
+        diffs += [b - a for a, b in zip(*got)]
+    return diffs
+
+
+def paired_ll_sources(by_season, backbone, a_src, b_src, window, w, select,
+                      gained):
+    """Per-match log-loss differences between two SOURCES at the same weight.
+
+    paired_ll asks "is this signal worth more than zero weight". This asks the
+    question a second feed actually poses: holding the blend weight fixed, does
+    swapping one source's form line for another's improve the prediction of the
+    SAME matches? Both arms are graded on the mask `b_src` defines, so the rows
+    are identical and the comparison is paired match by match.
+    """
+    diffs = []
+    for fit_s, grade_s in fold_pairs(by_season):
+        rows = by_season[grade_s]
+        p = dict(backbone[fit_s], w_form=w, league_weights=False)
+        mask = None
+        got = []
+        for src in (a_src, b_src):
+            lam, both, valid = domestic_lambdas(rows, p, w, src, window, True)
+            if mask is None:
+                mask = select_mask(rows, b_src, window, both, valid, select, gained)
             gr = [r for r, m in zip(rows, mask) if m]
             gl = [l for l, m in zip(lam, mask) if m]
             got.append(ll_series(gr, capped(p, gr, gl), gl))
@@ -933,7 +1016,7 @@ def fit_split_weight(by_season, backbone, source, window, his, los):
 
 
 def report_arm(by_season, backbone, weights, label, source, hybrid, note,
-               select="both", align=None):
+               select="both", align=None, gained=None):
     """Sweep every window for one arm, print the winner's table, return it.
 
     The window is chosen on LOG-LOSS, not on points. Points-per-match is the
@@ -951,7 +1034,7 @@ def report_arm(by_season, backbone, weights, label, source, hybrid, note,
     summary = []
     for window in DOM_WINDOWS:
         sw = sweep_domestic(by_season, backbone, weights, source, window,
-                            hybrid, select, align)
+                            hybrid, select, align, gained)
         if not sw:
             continue
         n = sw.pop("n")
@@ -1496,6 +1579,44 @@ def main():
             "xg", True,
             "the diagnostic: does the Elo-rescaled line carry anything, or "
             "only dilute?", select="rest")
+        # ---- arms E: a WIDER feed for the clubs Understat cannot see -------
+        # Arm B- says the Elo-rescaled two thirds of the field carry nothing,
+        # which is unsurprising: that line is a function of Elo, so blending it
+        # with Elo is close to a no-op. The fix is not a better rescale, it is
+        # real data. football-data's free tier — already authorised, already
+        # rate-limited for, no scraper — covers two of the missing leagues,
+        # the Eredivisie and the Primeira Liga, in GOALS rather than xG.
+        #
+        # Arm C0 already established that goals are a much weaker signal than
+        # xG (t=+1.50 against +4.32 on identical matches), and that finding is
+        # not overturned here and is not being appealed. It answered "are goals
+        # as good as xG for clubs we already cover". This asks the far easier
+        # question: for clubs whose current form line is an Elo restatement, is
+        # ANY real domestic observation better than that? The bar is arm B-'s
+        # -0.0026 nats, which is to say the bar is approximately zero.
+        gained = ("wide", "xg")
+        print("\n" + "-" * 78)
+        print("ARMS E — the deployed hybrid with NED/POR clubs on real GOALS")
+        arms["E"] = report_arm(
+            by_season, backbone, weights,
+            "ARM E — wide hybrid (xG big five, GOALS for NED/POR, else Elo)",
+            "wide", True,
+            "the candidate deployment: same shape as arm B, four more clubs a "
+            "season on real data", select="all")
+        arms["E+"] = report_arm(
+            by_season, backbone, weights,
+            "ARM E+ — wide hybrid, ONLY the matches NED/POR coverage touches",
+            "wide", True,
+            "where the change can actually show: matches with a Dutch or "
+            "Portuguese club in them", select="new", gained=gained)
+        arms["B+"] = report_arm(
+            by_season, backbone, weights,
+            "ARM B+ — deployed xG hybrid, on EXACTLY arm E+'s matches",
+            "xg", True,
+            "the incumbent on the same fixtures — those clubs rescaled from "
+            "Elo. This is the\n  number arm E+ has to beat, and it is arm B-'s "
+            "-0.0026 restricted to NED/POR.",
+            select="new", gained=gained)
         # ---- arm D: the coverage-dependent weight arm B- argues for --------
         his = [round(i * 0.05, 2) for i in range(21)]
         los = [round(i * 0.05, 2) for i in range(9)]
@@ -1550,7 +1671,7 @@ def main():
         print("\nStage 2b summary — every arm, at its best window")
         print(f"  {'arm':4} {'window':>7} {'n/fold':>8} {'w*':>5} {'pts@w*':>8} "
               f"{'pts@0':>8} {'dpts':>7} {'LL@w*':>8} {'LL@0':>8} {'dLL':>8}")
-        for k in ("A", "B", "C0", "C", "B-"):
+        for k in ("A", "B", "C0", "C", "B-", "E", "B+", "E+"):
             a = arms.get(k)
             if not a:
                 continue
@@ -1568,15 +1689,19 @@ def main():
               "\n  paired on the same fixtures, 95% bootstrap interval. "
               "Negative = better.")
         sig = {}
-        for k, src, hyb, sel in (("A", "xg", False, "both"),
-                                 ("B", "xg", True, "all"),
-                                 ("C0", "goals", False, "both"),
-                                 ("C", "goals", True, "all")):
+        SIG_ARMS = (("A", "xg", False, "both", None),
+                    ("B", "xg", True, "all", None),
+                    ("C0", "goals", False, "both", None),
+                    ("C", "goals", True, "all", None),
+                    ("E", "wide", True, "all", None),
+                    ("B+", "xg", True, "new", gained),
+                    ("E+", "wide", True, "new", gained))
+        for k, src, hyb, sel, gn in SIG_ARMS:
             a = arms.get(k)
             if not a:
                 continue
             d = paired_ll(by_season, backbone, src, a["window"], hyb, sel,
-                          0.0, a["w_ll"])
+                          0.0, a["w_ll"], gn)
             sig[k] = significance(
                 d, f"arm {k}: w_form 0 -> {a['w_ll']:.2f} (window {a['window']}, "
                    f"n={len(d)})")
@@ -1613,15 +1738,12 @@ def main():
         print(f"  {'arm':4} {'window':>7} {'n':>5} {'b_form':>9} {'se':>7} "
               f"{'t':>7}  {'elo/form r':>10}  {'implied w_form':>22}")
         best_inc = {}
-        for k, src, hyb, sel in (("A", "xg", False, "both"),
-                                 ("B", "xg", True, "all"),
-                                 ("C0", "goals", False, "both"),
-                                 ("C", "goals", True, "all")):
+        for k, src, hyb, sel, gn in SIG_ARMS:
             if not arms.get(k):
                 continue
             p = dict(backbone[args.seasons[0]], league_weights=False)
             for window in DOM_WINDOWS:
-                t = incremental_test(by_season, src, window, hyb, sel, p)
+                t = incremental_test(by_season, src, window, hyb, sel, p, gn)
                 if not t:
                     continue
                 if k not in best_inc or abs(t["t"]) > abs(best_inc[k][1]["t"]):
@@ -1633,10 +1755,43 @@ def main():
         print("  t beyond +/-1.96 is a real increment over Elo at 95%. t is "
               "scale-free, so it\n  is the fair xG-vs-goals comparison; the raw "
               "b is not (the two live on\n  different scales).")
-        for k in ("A", "B", "C0", "C"):
+        for k in [a[0] for a in SIG_ARMS]:
             if k in best_inc:
                 w, t = best_inc[k]
                 print(f"    arm {k:3} strongest at window {str(w):>4}: t={t['t']:+.2f}")
+
+        # ---- E vs B head to head, on the matches that can tell them apart --
+        # Everything above compares an arm against w_form=0. That is the right
+        # test for "is there a signal", and the wrong one for "should we switch
+        # feeds": both arms carry the same xG signal on the same ~22 clubs, so
+        # against pure Elo they will look nearly identical whatever the NED/POR
+        # clubs do. The question is narrower and is asked directly here — hold
+        # the weight fixed, swap ONLY those clubs' form line from Elo-rescaled
+        # to measured goals, and score the same fixtures both ways.
+        print("\n  Arm E vs arm B, paired on identical fixtures, weight held "
+              "fixed.\n  Negative = the wider feed predicts those matches "
+              "better. This is the\n  comparison the decision actually turns "
+              "on.")
+        e_win = arms["E+"]["window"] if arms.get("E+") else 20
+        n_new = {}
+        for s_key, rws in by_season.items():
+            nc = newly_covered(rws, "wide", "xg", e_win)
+            n_new[s_key] = sum(nc)
+        print(f"  matches with a NED/POR club, window {e_win}: "
+              f"{', '.join(f'{k} {v}' for k, v in sorted(n_new.items()))} "
+              f"(of {'/'.join(str(len(by_season[k])) for k in sorted(by_season))})")
+        for w in (0.30, 0.50, 0.79):
+            d = paired_ll_sources(by_season, backbone, "xg", "wide", e_win, w,
+                                  "new", gained)
+            significance(d, f"B -> E at w_form={w:.2f} (window {e_win}, "
+                            f"n={len(d)})")
+        print("  and over ALL 378 matches, where the switch is diluted by the "
+              "~300 it\n  cannot touch:")
+        for w in (0.30,):
+            d = paired_ll_sources(by_season, backbone, "xg", "wide", e_win, w,
+                                  "all", gained)
+            significance(d, f"B -> E at w_form={w:.2f}, every match "
+                            f"(n={len(d)})")
 
         # ---- the weight to ship -------------------------------------------
         # Window from the incremental test, weight from the full-model sweep at

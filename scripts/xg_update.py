@@ -49,6 +49,20 @@ they already had — Elo-seeded before the competition starts, results-driven
 after. That is a real asymmetry: a Portuguese or Dutch entrant is modelled on a
 weaker signal than an English one, and the site should not pretend otherwise.
 
+Widening it was tried and did not work
+--------------------------------------
+The obvious fix is real domestic data for the missing clubs, and two of the
+missing leagues are free and already authorised: football-data's tier carries
+the Eredivisie and the Primeira Liga, in goals rather than xG. backtest.py's
+arm E measures exactly that swap — those four-a-season clubs on measured goals
+instead of reseed_uncovered's Elo rescale — and it is worth -0.0009 nats over
+the whole field, -0.0044 on the 81 matches it can touch, with intervals several
+times the effect, and it moves the fitted form weight DOWN. reseed_uncovered
+therefore still handles every non-big-five club. The full numbers are in the
+W_NO_MKT block in scripts/model.py; the short version is that plain goals are
+too weak a signal to be worth four clubs, and what would help is xG for those
+leagues rather than more goals from them.
+
 On the dependency
 -----------------
 This is the only script in the pipeline that needs a third-party package, and
@@ -130,12 +144,19 @@ def rolling(rows, last):
     return out
 
 
-# Understat league keys -> the country codes used in confed_weight, which come
-# from ClubElo's vocabulary.
-UNDERSTAT_TO_CODE = {
+# League keys -> the country codes used in confed_weight, which come from
+# ClubElo's vocabulary. The first five are Understat's own keys. The last two
+# never come out of Understat and are here because scripts/xg_history.py's
+# wider series speaks the same vocabulary for the two leagues football-data
+# covers and Understat does not; fit_league_weights below silently drops any
+# league it cannot map, which would have quietly excluded them from the pooled
+# Elo line and left them on a guessed weight instead of a measured one.
+LEAGUE_TO_CODE = {
     "ENG-Premier League": "ENG", "ESP-La Liga": "ESP", "FRA-Ligue 1": "FRA",
     "GER-Bundesliga": "GER", "ITA-Serie A": "ITA",
+    "NED-Eredivisie": "NED", "POR-Primeira Liga": "POR",
 }
+UNDERSTAT_TO_CODE = LEAGUE_TO_CODE      # the name this was shipped under
 
 
 def fit_league_weights(stats, elo_snapshot, aliases):

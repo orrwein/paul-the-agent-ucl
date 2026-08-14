@@ -27,6 +27,14 @@ the historical series that makes it measurable, for two sources:
   as well, the whole soccerdata dependency (a TLS-fingerprint shim against a
   bot-protected site, the repo's only third-party package, and a manual weekly
   step) buys nothing and can go.
+* Both at once (``wide_series``) — xG for the big five and goals for the two
+  further leagues football-data reaches, the Eredivisie and the Primeira Liga.
+  That is the widest form signal obtainable for free from sources this project
+  is already entitled to use, and it exists to answer a different question from
+  the control above: not "are goals as good as xG" (they are not) but "for a
+  club whose form line is currently regressed from its own Elo, is any real
+  observation better than none". backtest.py's arms E/E+/B+ measure it. The
+  answer came back no, and the series is kept so the answer stays reproducible.
 
 Caching is the point
 --------------------
@@ -65,13 +73,24 @@ UNDERSTAT_LEAGUES = ["ENG-Premier League", "ESP-La Liga", "FRA-Ligue 1",
                      "GER-Bundesliga", "ITA-Serie A"]
 LEAGUE_CODE = {"ENG-Premier League": "ENG", "ESP-La Liga": "ESP",
                "FRA-Ligue 1": "FRA", "GER-Bundesliga": "GER",
-               "ITA-Serie A": "ITA"}
+               "ITA-Serie A": "ITA",
+               # football-data-only, goals rather than xG — see FD_WIDE_COMPS
+               "NED-Eredivisie": "NED", "POR-Primeira Liga": "POR"}
 
 # football-data competition codes for the same five leagues, mapped onto
 # soccerdata's league keys so both sources speak one vocabulary downstream and
 # xg_update.fit_league_weights can be reused unmodified on either of them.
 FD_COMPS = {"PL": "ENG-Premier League", "PD": "ESP-La Liga",
             "FL1": "FRA-Ligue 1", "BL1": "GER-Bundesliga", "SA": "ITA-Serie A"}
+
+# The two leagues football-data's free tier covers that Understat does not, and
+# that send clubs to the Champions League most seasons: the Eredivisie (Ajax,
+# PSV, Feyenoord) and the Primeira Liga (Benfica, Porto, Sporting, Braga).
+# Deliberately kept OUT of FD_COMPS, because FD_COMPS defines the goals-vs-xG
+# control arm and that comparison only means anything on matches where both
+# sources see the same clubs. These are the clubs where the alternative is not
+# xG but a line rescaled from Elo — a different, and much lower, bar.
+FD_WIDE_COMPS = {"DED": "NED-Eredivisie", "PPL": "POR-Primeira Liga"}
 
 # Understat season keys, and football-data's naming of the same seasons (it
 # names a season by its starting year).
@@ -162,6 +181,34 @@ def goals_series(seasons=None, build=False, comps=None):
                              m["awayTeam"].get("shortName") or m["awayTeam"]["name"],
                              float(ft["home"]), float(ft["away"])))
     return sorted(rows)
+
+
+# ---------------------------------------------------------------------------
+# Source 3 — the widest thing that is free, documented and already authorised
+# ---------------------------------------------------------------------------
+def wide_series(seasons=None, build=False):
+    """xG where Understat reaches, GOALS for the Eredivisie and Primeira Liga.
+
+    Two different measurements in one series, which needs saying out loud
+    because it looks like a category error. It is not, for one reason: the
+    thing this replaces is worse than either. A club outside Understat's five
+    leagues currently gets a form line REGRESSED FROM ITS OWN ELO by
+    xg_update.reseed_uncovered, so blending it with the Elo backbone is close
+    to blending Elo with itself. Real domestic goals are noisier than real
+    domestic xG — measured, at t=+1.50 against +4.32 on identical matches — but
+    they are a genuinely independent observation of the club, which the Elo
+    rescale is not. The comparison here is against nothing, not against xG.
+
+    The two scales are close enough to pool (a big-five club averages about 1.4
+    xG a match and a Eredivisie club about 1.6 goals), and what gap remains is
+    exactly what xg_update.fit_league_weights measures and divides out: it
+    regresses output on Elo across every club in the pooled series and
+    discounts, per league, whatever sits above the common line. A league that
+    is reported in goals rather than xG is handled by that machinery in the
+    same way as a league that simply scores more.
+    """
+    return sorted(xg_series(seasons, build)
+                  + goals_series(seasons, build, FD_WIDE_COMPS))
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +305,12 @@ def main():
     ap.add_argument("--seasons", nargs="+", default=SEASONS)
     args = ap.parse_args()
 
-    for label, fn in (("Understat xG", xg_series), ("football-data goals", goals_series)):
+    sources = (("Understat xG", xg_series),
+               ("football-data goals", goals_series),
+               ("football-data goals, NED+POR",
+                lambda s, build=False: goals_series(s, build, FD_WIDE_COMPS)),
+               ("wide (xG + NED/POR goals)", wide_series))
+    for label, fn in sources:
         try:
             rows = fn(args.seasons, build=args.build)
         except SystemExit as e:
