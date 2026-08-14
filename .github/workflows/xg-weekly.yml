@@ -25,6 +25,11 @@ on:
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
+    inputs:
+      probe_only:
+        description: "Just check Understat is reachable, skip the refresh"
+        type: boolean
+        default: false
 
 concurrency:
   group: xg-weekly
@@ -47,7 +52,43 @@ jobs:
       - name: Install the optional xG dependency
         run: pip install -r requirements.txt
 
+      # Can we reach the source AT ALL from a GitHub runner? Understat sits
+      # behind bot protection and datacenter IP ranges are exactly what that
+      # protection targets, so this is not a given — and before the draw the
+      # refresh below is skipped, which would otherwise let this workflow go
+      # green every week while proving nothing.
+      #
+      # One league, one completed season: the smallest fetch that answers the
+      # question. Also the first thing to run by hand if the Monday job starts
+      # failing months from now.
+      - name: Probe the xG source
+        env:
+          SOCCERDATA_DIR: ${{ github.workspace }}/data/soccerdata
+        run: |
+          mkdir -p "$SOCCERDATA_DIR/config"
+          python3 - <<'PY'
+          import warnings; warnings.filterwarnings("ignore")
+          import soccerdata as sd
+          try:
+              df = sd.Understat(leagues="ENG-Premier League",
+                                seasons="2025-2026").read_schedule()
+              n = len(df)
+              xg = df["home_xg"].notna().sum() if "home_xg" in df else 0
+              print(f"::notice::Understat reachable from this runner: "
+                    f"{n} matches, {xg} with xG.")
+              if not n or not xg:
+                  raise SystemExit("::error::Reachable but returned no xG.")
+          except SystemExit:
+              raise
+          except Exception as e:
+              raise SystemExit(
+                  f"::error::Understat unreachable from GitHub's IP range "
+                  f"({type(e).__name__}: {e}). The weekly refresh cannot run "
+                  f"here; fall back to a local scheduled run.")
+          PY
+
       - name: Check the field is drawn
+        if: ${{ !inputs.probe_only }}
         id: state
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
