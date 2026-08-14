@@ -63,6 +63,25 @@ Ordered by when it can first be done.
       (the column is per round) but every pick locked under the old ones was
       chosen to maximise the wrong thing.
 
+- [ ] **Job-health panel on the site.** Three ways an automated job fails, and
+      only one of them is visible today:
+
+      1. **It runs and fails** — red in the Actions tab. Already visible, but
+         only if someone looks.
+      2. **It stops firing** — no red, no run, nothing. The 60-day cron
+         disable below is one cause; a renamed workflow or a GitHub outage are
+         others. Invisible by construction.
+      3. **It runs green and does nothing** — the dangerous one. Both happened
+         in a single session: the first nightly dispatch went green while
+         ingesting *last season's* field, and the first weekly xG dispatch went
+         green while skipping every step that mattered.
+
+      A status table that only shows last-run-conclusion catches (1) alone. So
+      each job writes a heartbeat recording what it actually DID — clubs
+      rated, results ingested, picks refreshed — and the site flags a job as
+      stale when nothing has arrived within its expected cadence. Green means
+      "ran, recently, and moved something".
+
 ## Draw day (27 Aug)
 
 - [ ] **`ingest.py --teams --fixtures`.** First contact with real data. Expect
