@@ -47,6 +47,7 @@ import urllib.request
 from datetime import date, datetime, timezone
 
 from paths import DB, ROOT
+import jobs as J
 import tournament as T
 
 CLUBELO_URL = "http://api.clubelo.com/{date}"
@@ -348,6 +349,14 @@ def round_for(match):
     return base
 
 
+# Set the moment football-data says it has never heard of this season. The
+# heartbeat needs it: every count coming back zero is either "the draw has not
+# happened" or "something is broken", and those look identical from the
+# outside. This flag is the difference, and it is why the panel can render a
+# pre-draw ingest as healthy-and-waiting instead of as a silent no-op.
+SEASON_ABSENT = False
+
+
 def fd_get_season(path):
     """fd_get, but a 404 means "this season isn't in the feed yet".
 
@@ -355,10 +364,12 @@ def fd_get_season(path):
     publishes the draw. That is the expected state every day until 27 August,
     not an error: return None and let the caller no-op politely.
     """
+    global SEASON_ABSENT
     try:
         return fd_get(path)
     except SystemExit as e:
         if "HTTP 404" in str(e):
+            SEASON_ABSENT = True
             return None
         raise
 
@@ -586,21 +597,52 @@ def main():
 
     con = sqlite3.connect(DB)
     print(f"{T.TOURNAMENT} — ingesting into {os.path.relpath(DB, ROOT)}")
-    if args.all or args.teams:
-        ingest_teams(con); con.commit()
-    if args.all or args.fixtures:
-        ingest_fixtures(con); con.commit()
-    if args.all or args.elo:
-        ingest_elo(con, args.on); con.commit()
-    if args.all or args.seed_form:
-        seed_form(con); con.commit()
-    if args.all or args.results:
-        ingest_results(con); con.commit()
-    if args.all or args.scorers:
-        ingest_scorers(con); con.commit()
-    if args.all or args.odds:
-        ingest_odds(con); con.commit()
-    con.close()
+
+    # Every step reports what it wrote, and those numbers are the heartbeat.
+    # This is the job whose green-but-empty run started the whole idea: the
+    # first dispatched nightly pulled last season's field and reported
+    # success, and "36 clubs, 144 fixtures" dated 14 August would have said so
+    # at a glance. The count that matters most day to day is clubs_rated —
+    # ingest_elo returns 0 both when the field is unknown and when ClubElo is
+    # unreachable and stale ratings are kept, and the second of those is a
+    # model quietly running on yesterday's numbers.
+    with J.record("ingest") as run:
+        if args.all or args.teams:
+            run.set(clubs=ingest_teams(con)); con.commit()
+        if args.all or args.fixtures:
+            run.set(fixtures=ingest_fixtures(con)); con.commit()
+        if args.all or args.elo:
+            run.set(clubs_rated=ingest_elo(con, args.on)); con.commit()
+        if args.all or args.seed_form:
+            run.set(form_seeded=seed_form(con)); con.commit()
+        if args.all or args.results:
+            run.set(results=ingest_results(con)); con.commit()
+        if args.all or args.scorers:
+            run.set(scorers=ingest_scorers(con)); con.commit()
+        if args.all or args.odds:
+            run.set(odds=ingest_odds(con)); con.commit()
+
+        teams_known = con.execute("SELECT COUNT(*) FROM teams").fetchone()[0]
+        con.close()
+
+        if any(run.counts.values()):
+            run.ok(", ".join(f"{v} {k.replace('_', ' ')}"
+                             for k, v in sorted(run.counts.items()) if v))
+        elif SEASON_ABSENT or not teams_known:
+            # The one case where nothing at all is the right answer, stated
+            # out loud so the panel can show it as waiting rather than broken.
+            run.skipped(f"season {FD_SEASON}/{int(FD_SEASON) + 1 - 2000} is "
+                        f"not in the feed yet — the draw is still to come")
+        else:
+            # The feeds answered, the field is known, and every step still came
+            # back with nothing. The outcome deliberately stays `ok` — the run
+            # did not fail, and pretending it did would be its own lie — so the
+            # panel catches it on the counts instead and renders it as a no-op.
+            # This is the shape of the draw-day failure LAUNCH.md warns about:
+            # one unmatched club name rates nobody, and exits zero doing it.
+            run.note(f"every requested step returned nothing while "
+                     f"{teams_known} clubs sit in the database — a green run "
+                     f"that moved no data")
     print("done.")
 
 

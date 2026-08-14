@@ -72,7 +72,7 @@ jobs:
           # without. Asserting the whole payload shape here would turn every
           # site tweak into a CI failure.
           required = {"generated_at", "summary", "rounds", "table", "teams",
-                      "bracket", "futures", "title_race", "top_scorer"}
+                      "bracket", "futures", "title_race", "top_scorer", "jobs"}
           missing = required - set(d)
           if missing:
               sys.exit(f"docs/data.json is missing keys: {sorted(missing)}")
@@ -83,8 +83,26 @@ jobs:
           graded = d["summary"].get("graded", 0)
           if not graded:
               sys.exit("nothing was graded — the seeded results never reached the export")
+          # The job panel has to survive its own exporter. The run that wrote
+          # this file must appear in it — that splice is what stops the site
+          # build reporting itself one run behind — and the counts must be
+          # real, because a panel that shows zeroes for a run that plainly did
+          # work would train the reader to ignore the one signal it exists to
+          # give.
+          jobs = d["jobs"]
+          if not jobs.get("any"):
+              sys.exit("the job panel recorded nothing, but this run exported a payload")
+          export = next((j for j in jobs["jobs"] if j["id"] == "export"), None)
+          if not export or not export["last"]:
+              sys.exit("the export job has no heartbeat in the payload it wrote")
+          if not any(export["last"]["counts"].values()):
+              sys.exit(f"the export heartbeat claims it moved nothing: "
+                       f"{export['last']['counts']}")
           print(f"docs/data.json OK: {graded} graded, "
                 f"{len(d['table'])} table rows, {len(d['rounds'])} rounds")
+          print(f"job panel: " + ", ".join(
+              f"{j['id']}={(j['last'] or {}).get('outcome') or 'never'}"
+              for j in jobs["jobs"]))
           PY
 
       - name: Confirm the scratch database was used

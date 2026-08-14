@@ -715,6 +715,178 @@ function renderFutures(d) {
   }).join("");
 }
 
+/* ------------------------------------------------------------- job health */
+/* Three ways an automated job stops working, and only one of them is a red
+ * tick in the Actions tab (see scripts/jobs.py). This panel is built to catch
+ * the other two.
+ *
+ * Every judgement below is made HERE, in the browser, against the reader's
+ * clock — never baked into the payload. That placement is the whole trick for
+ * failure mode 2: a payload carrying a precomputed "all healthy" would keep
+ * saying so forever if the pipeline that regenerates it died. Because the
+ * exporter ships only timestamps and cadences, a file that stops being rebuilt
+ * ages into its own alarm, and the site build's own heartbeat — written by the
+ * very run that produced the page you are reading — goes stale first.
+ */
+const JOB_STATE = {
+  healthy: { lbl: "Healthy", cls: "j-ok", dot: "●" },
+  waiting: { lbl: "Waiting", cls: "j-wait", dot: "●" },
+  running: { lbl: "Running", cls: "j-wait", dot: "◐" },
+  "no-op":  { lbl: "Did nothing", cls: "j-noop", dot: "▲" },
+  stale:    { lbl: "Overdue", cls: "j-stale", dot: "▲" },
+  failed:   { lbl: "Failed", cls: "j-fail", dot: "✕" },
+  unknown:  { lbl: "No runs yet", cls: "j-none", dot: "○" },
+};
+
+/** Hours since an ISO timestamp, or null. */
+function hoursSince(iso) {
+  if (!iso) return null;
+  const t = Date.parse(iso.endsWith("Z") || /[+-]\d\d:\d\d$/.test(iso) ? iso : iso + "Z");
+  if (isNaN(t)) return null;
+  return (Date.now() - t) / 36e5;
+}
+
+function relTime(iso) {
+  const h = hoursSince(iso);
+  if (h == null) return "never";
+  if (h < 1 / 60) return "just now";
+  if (h < 1) return Math.round(h * 60) + " min ago";
+  if (h < 48) return Math.round(h) + " h ago";
+  return Math.round(h / 24) + " days ago";
+}
+
+/* The ordering is a priority list, not a taxonomy: a job can be several of
+ * these at once and the panel must lead with the one that most needs acting
+ * on. Overdue outranks failed deliberately — a job that failed yesterday is a
+ * bug, a job that has not been heard from since is a bug plus the possibility
+ * that nothing is running at all, and the second is strictly worse news. */
+function jobState(j) {
+  const last = j.last;
+  if (!last) return "unknown";
+  const age = hoursSince(j.last_alive_at);
+  if (age != null && age > j.cadence_hours + j.grace_hours) return "stale";
+  if (last.outcome === "failed") return "failed";
+  if (!last.outcome) return "running";
+  if (last.outcome === "skipped") return "waiting";
+  // `ok` while every count sits at zero: the run asserts it worked and its own
+  // accounting says nothing moved. That contradiction is failure mode 3, and
+  // it is the only thing on this page that a green run cannot talk its way
+  // out of — claiming there was nothing to do requires saying `skipped`, with
+  // a reason, which shows up as Waiting and prints that reason underneath.
+  const counts = last.counts || {};
+  const moved = Object.keys(counts).some((k) => counts[k] > 0);
+  return moved ? "healthy" : "no-op";
+}
+
+function countsHTML(counts) {
+  const keys = Object.keys(counts || {}).sort();
+  if (!keys.length) return "<span class='j-dim'>nothing recorded</span>";
+  return keys
+    .map((k) => `<span class="j-count${counts[k] ? "" : " zero"}">
+        <b>${esc(counts[k])}</b> ${esc(k.replace(/_/g, " "))}</span>`)
+    .join("");
+}
+
+function renderJobs(d) {
+  const strip = $("jobsStrip");
+  const panel = $("jobsPanel");
+  const block = d.jobs;
+  if (!strip || !panel) return;
+
+  if (!block || !block.jobs || !block.jobs.length) {
+    strip.hidden = true;
+    return;
+  }
+
+  const rows = block.jobs.map((j) => ({ j, st: jobState(j) }));
+  const bad = rows.filter((r) => ["stale", "failed", "no-op"].includes(r.st));
+  const waiting = rows.filter((r) => r.st === "waiting").length;
+  const unknown = rows.filter((r) => r.st === "unknown").length;
+
+  /* The one-line answer to "is anything wrong?", which is the question this
+   * whole section exists to answer without a click. */
+  let tone = "j-ok";
+  let headline;
+  if (!block.any) {
+    tone = "j-none";
+    headline = "No job runs recorded yet";
+  } else if (bad.length) {
+    tone = bad.some((r) => r.st === "failed") ? "j-fail" : "j-stale";
+    headline = `${bad.length} job${bad.length > 1 ? "s need" : " needs"} attention` +
+      " — " + bad.map((r) => `${esc(r.j.label)}: ${JOB_STATE[r.st].lbl.toLowerCase()}`).join(", ");
+  } else if (unknown === rows.length) {
+    tone = "j-none";
+    headline = "No job runs recorded yet";
+  } else if (unknown) {
+    /* Never having run is not the same as having stopped, and it must not be
+     * dressed as an alarm: on a fresh database every job looks like this
+     * until its first scheduled slot comes round. Grey, counted, and stated. */
+    tone = "j-none";
+    headline = `${unknown} of ${rows.length} jobs have not reported yet`;
+  } else if (waiting === rows.length) {
+    tone = "j-wait";
+    headline = `All ${rows.length} jobs healthy — waiting for the draw`;
+  } else {
+    headline = `All ${rows.length} jobs healthy`;
+  }
+
+  strip.hidden = false;
+  strip.innerHTML = `
+    <button type="button" id="jobsBtn" class="jobs-btn ${tone}"
+            aria-expanded="false" aria-controls="jobsPanel">
+      <span class="j-dot" aria-hidden="true">${JOB_STATE[bad.length ? bad[0].st : (block.any ? "healthy" : "unknown")].dot}</span>
+      <span class="j-head">${headline}</span>
+      <span class="j-chev" aria-hidden="true">▾</span>
+    </button>`;
+
+  /* Column order is load-bearing. The verdict sits second, not last, because
+   * on a narrow screen the table scrolls horizontally and whatever is on the
+   * right goes off the edge — and the one thing that must never need a
+   * sideways swipe is whether the job is all right. */
+  const body = block.any
+    ? `<p class="jobs-cap">Every automated process writes a heartbeat saying
+        what it actually did. A job is flagged when nothing has arrived within
+        its cadence — which is the only way a job that stopped firing
+        altogether can be noticed at all.</p>
+       <div class="tbl-scroll"><table class="jobs-tbl">
+        <thead><tr>
+          <th class="col-team">Job</th><th class="col-team">State</th>
+          <th class="col-team">Cadence</th><th class="col-team">Last run</th>
+          <th class="col-team">What it did</th>
+        </tr></thead>
+        <tbody>${rows.map(({ j, st }) => {
+          const m = JOB_STATE[st];
+          const last = j.last;
+          const ref = last && last.ref && last.ref !== "local"
+            ? ` <a href="${esc(last.ref)}" rel="noopener" class="j-ref">run&nbsp;log</a>` : "";
+          return `<tr class="${m.cls}">
+            <td class="col-team"><b>${esc(j.label)}</b>
+              <span class="j-what">${esc(j.what)}</span></td>
+            <td class="col-team"><span class="pill j-pill ${m.cls}">${esc(m.lbl)}</span></td>
+            <td class="col-team j-dim">${esc(j.cadence)}</td>
+            <td class="col-team">${esc(relTime(j.last_alive_at))}${ref}
+              <span class="j-what">${j.runs_7d} run${j.runs_7d === 1 ? "" : "s"} in 7 days${j.fails_7d ? `, ${j.fails_7d} failed` : ""}</span></td>
+            <td class="col-team">${last ? countsHTML(last.counts) : "<span class='j-dim'>—</span>"}
+              ${last && last.note ? `<span class="j-note">${esc(last.note)}</span>` : ""}</td>
+          </tr>`;
+        }).join("")}</tbody></table></div>`
+    : `<div class="empty"><b>No runs recorded yet.</b><span class="why">
+        Nothing has run against this database since heartbeats were added, so
+        there is nothing to report — which is the honest answer, not a fault.
+        The first nightly refresh will fill this in.</span></div>`;
+
+  panel.innerHTML = body;
+  const btn = $("jobsBtn");
+  const toggle = (open) => {
+    btn.setAttribute("aria-expanded", String(open));
+    panel.hidden = !open;
+  };
+  btn.addEventListener("click", () => toggle(panel.hidden));
+  // Open on arrival when something is wrong. "Is anything broken?" should
+  // never require a click; only "which numbers exactly" should.
+  toggle(bad.length > 0);
+}
+
 /* ----------------------------------------------------------------- method */
 const METHODS = [
   { ic: "📊", name: "Club Elo, cross-league", body: "Ratings come from a feed that folds in every European and domestic result, so a Norwegian champion and an English one sit on the same scale. Home advantage is a fitted 85 Elo points, and zero at the neutral final." },
@@ -765,6 +937,7 @@ async function main() {
   renderScorer(d);
   renderFutures(d);
   renderMethod();
+  renderJobs(d);
 }
 
 main();

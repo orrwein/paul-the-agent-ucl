@@ -36,6 +36,16 @@ scoring"), so the payload marks it ``scoring.public = false`` and the site keeps
 it behind an explicit opt-in toggle. The numbers are still exported, because
 hiding them in the *data* would make the scorecard unauditable.
 
+Job health
+----------
+The payload carries a ``jobs`` block: one heartbeat per automated process,
+saying when it last ran and what it actually moved. It ships facts and
+cadences only — whether a job is overdue is decided in the browser against the
+reader's clock, because staleness computed here would be frozen into a file
+that, if the pipeline stopped regenerating it, would go on insisting
+everything was fine. See scripts/jobs.py for the three failure modes this is
+built around.
+
 No external assets
 ------------------
 Clubs have no flag emoji, so each club gets a monogram badge: initials derived
@@ -51,6 +61,7 @@ import zlib
 from datetime import datetime, timezone
 
 from paths import DB, TOURNAMENT
+import jobs as J
 import scoring as S
 import tournament as T
 
@@ -984,6 +995,10 @@ def build_payload(con):
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "tournament": TOURNAMENT,
         "state": state,
+        # Read through the read-only connection, and tolerant of a database
+        # that predates the table: an old DB renders as "no runs recorded
+        # yet", which is the truth about it rather than four false alarms.
+        "jobs": J.panel(con),
         "format": {
             "n_teams": T.N_TEAMS,
             "matches_each": T.MATCHES_EACH,
@@ -1026,15 +1041,39 @@ def build_payload(con):
 
 
 def main():
-    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-    try:
-        payload = build_payload(con)
-    finally:
-        con.close()
+    with J.record("export") as run:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        try:
+            payload = build_payload(con)
+        finally:
+            con.close()
 
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+        summary = payload["summary"]
+        run.set(clubs=len(payload["table"]),
+                picks=summary["locked"], graded=summary["graded"])
+        if payload["state"]["teams_known"]:
+            run.ok(f"payload rebuilt: {len(payload['table'])} clubs, "
+                   f"{summary['locked']} picks, {summary['graded']} graded")
+        else:
+            # A pre-draw payload is a real, correct piece of work that moves
+            # none of the numbers above, and jobs.py's contract is that such a
+            # run must say so out loud rather than let a row of zeroes be read
+            # as a job that has quietly stopped doing anything.
+            run.skipped("pre-draw payload — no clubs drawn yet, so there is "
+                        "nothing to tabulate or grade")
+
+        # This run's own heartbeat, spliced in before the file is written.
+        # Without it the site would always show the site build one run behind
+        # itself, and this is the row that carries the most information of
+        # any of them: it is written by the very run that built the page being
+        # read, so if its timestamp is old, the page itself is old — which is
+        # how a deploy that stopped firing becomes visible on the page the
+        # deploy stopped updating.
+        payload["jobs"] = J.merge_live(payload["jobs"], "export", run.preview())
+
+        os.makedirs(os.path.dirname(OUT), exist_ok=True)
+        with open(OUT, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
 
     s, size = payload["summary"], os.path.getsize(OUT)
     acc = f"{s['outcome_accuracy'] * 100:.1f}%" if s["outcome_accuracy"] else "n/a"
@@ -1045,6 +1084,15 @@ def main():
           f"{s['exact']} exact, {s['points']}/{s['points_max']} pts (internal)")
     print(f"  {len(payload['table'])} table rows, {len(payload['ties'])} ties, "
           f"{len(payload['odds'])} clubs in the title race")
+    jb = payload["jobs"]
+    if jb["any"]:
+        by_state = {}
+        for entry in jb["jobs"]:
+            by_state[J.state(entry)] = by_state.get(J.state(entry), 0) + 1
+        print("  jobs: " + ", ".join(f"{n} {k}" for k, n in
+                                     sorted(by_state.items())))
+    else:
+        print("  jobs: no runs recorded yet")
     rev = payload["revisions"]
     if rev:
         print(f"  {rev['revised']} pick(s) revised before kickoff across "

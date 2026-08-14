@@ -100,14 +100,53 @@ jobs:
 
       - name: Refresh team form from expected goals
         if: steps.state.outputs.teams != '0'
+        # xg_update.py records its own heartbeat: clubs measured, clubs
+        # rescaled, leagues re-weighted. Those three numbers are exactly what
+        # this workflow's own first dispatch lacked when it went green having
+        # skipped every step behind the pre-draw gate below.
         run: python3 scripts/xg_update.py --seasons 2026-2027
 
       - name: Rebuild the site payload
         if: steps.state.outputs.teams != '0'
         run: python3 scripts/export_site.py
 
+      # -------------------------------------------------------------------
+      # Every path out of this workflow leaves a heartbeat, because the two
+      # quiet ones are the dangerous ones. A probe-only dispatch and a
+      # pre-draw Monday both do no work by design; recording nothing would
+      # make them look identical to a cron that has stopped firing, which is
+      # the failure this panel exists to catch.
+      # -------------------------------------------------------------------
+      - name: Record the skip (probe only)
+        if: ${{ inputs.probe_only }}
+        run: |
+          python3 scripts/jobs.py record xg --outcome skipped \
+            --note "probe-only dispatch: Understat reachability confirmed, form deliberately not refreshed"
+
+      - name: Record the skip (waiting for the draw)
+        if: ${{ !inputs.probe_only && steps.state.outputs.teams == '0' }}
+        run: |
+          echo "::notice::No teams yet (draw is 27 Aug 2026) — nothing to refresh."
+          python3 scripts/jobs.py record xg --outcome skipped \
+            --note "no clubs in the database yet — the league-phase draw is 27 Aug 2026"
+
+      - name: Record the failure
+        # The probe above kills the job with SystemExit before xg_update.py is
+        # ever reached, so nothing else would write this down. Understat
+        # blocking GitHub's IP range is the single most likely way this job
+        # dies months from now, and it should say so on the site rather than
+        # only in an Actions run nobody opens.
+        if: failure()
+        run: |
+          python3 scripts/jobs.py record xg --outcome failed \
+            --note "the weekly run failed before it could refresh anything — most likely Understat refusing this runner; see the run log"
+
       - name: Commit if anything moved
-        if: steps.state.outputs.teams != '0'
+        # `always()`, and the database is staged unconditionally: on a skipped
+        # or failed week the heartbeat IS the only thing that moved, and it is
+        # the week it matters most. The refreshed payload reaches the site on
+        # the next nightly, which runs within 24 hours and deploys.
+        if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -118,7 +157,3 @@ jobs:
             git commit -m "Weekly xG refresh"
             git push
           fi
-
-      - name: Waiting for the draw
-        if: steps.state.outputs.teams == '0'
-        run: echo "::notice::No teams yet (draw is 27 Aug 2026) — nothing to refresh."

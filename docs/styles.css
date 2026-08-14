@@ -470,3 +470,74 @@ a:focus-visible, button:focus-visible, [tabindex]:focus-visible {
   th:last-child, td:last-child { padding-right: 12px; }
   .hstat { flex: 1 1 40%; min-width: 130px; }
 }
+
+/* --------------------------------------------------------- job health */
+/* Sits in the hero, under the "data generated" stamp. Two rules govern the
+   look: it must answer "is anything wrong?" in one glance while collapsed,
+   and it must not compete with the predictions when the answer is no — hence
+   a single muted line that only takes on alarm colour when it has to. */
+.jobs-strip { margin-top: 14px; display: flex; justify-content: center; }
+.jobs-btn {
+  font: inherit; font-size: 0.82rem; font-weight: 600; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 9px; text-align: left;
+  padding: 7px 14px; border-radius: 99px;
+  background: var(--card); border: 1px solid var(--card-brd); color: var(--muted);
+}
+.jobs-btn:hover { border-color: var(--line); color: var(--ink); }
+.jobs-btn .j-dot { font-size: 0.7rem; line-height: 1; }
+.jobs-btn .j-chev { color: var(--faint); font-size: 0.7rem; transition: transform 0.15s; }
+.jobs-btn[aria-expanded="true"] .j-chev { transform: rotate(180deg); }
+.jobs-btn.j-ok { color: var(--green); border-color: rgba(53, 230, 164, 0.28); }
+.jobs-btn.j-wait { color: var(--blue); border-color: rgba(125, 211, 252, 0.26); }
+.jobs-btn.j-stale, .jobs-btn.j-noop {
+  color: var(--amber); border-color: rgba(251, 191, 36, 0.38);
+  background: rgba(251, 191, 36, 0.08);
+}
+.jobs-btn.j-fail {
+  color: var(--red); border-color: rgba(251, 113, 133, 0.42);
+  background: rgba(251, 113, 133, 0.08);
+}
+.jobs-btn.j-none { color: var(--faint); }
+
+.jobs-panel { max-width: 1180px; margin: 4px auto 0; padding: 0 24px; text-align: left; }
+.jobs-panel[hidden] { display: none; }
+.jobs-tbl td { vertical-align: top; white-space: normal; }
+/* The first column carries a name and a one-line description; below about
+   190px it collapses into a ladder of single words. Let the scroller take the
+   strain instead — the State column beside it stays put either way. */
+.jobs-tbl td:first-child, .jobs-tbl th:first-child { min-width: 190px; }
+.jobs-tbl td.col-team { min-width: 100px; }
+.jobs-tbl td:last-child { width: 40%; min-width: 260px; }
+.jobs-cap {
+  color: var(--muted); font-size: 0.84rem; margin: 0 0 12px; max-width: 68ch;
+}
+/* Colour lives on the row edge rather than the text, so five rows of dense
+   numbers stay readable and the eye still lands on the row that is wrong. */
+.jobs-tbl tr.j-stale, .jobs-tbl tr.j-noop { box-shadow: inset 3px 0 0 var(--amber); }
+.jobs-tbl tr.j-fail { box-shadow: inset 3px 0 0 var(--red); }
+.jobs-tbl tr.j-ok { box-shadow: inset 3px 0 0 rgba(53, 230, 164, 0.5); }
+.jobs-tbl tr.j-wait { box-shadow: inset 3px 0 0 rgba(125, 211, 252, 0.45); }
+.jobs-tbl tr.j-none { box-shadow: inset 3px 0 0 rgba(255, 255, 255, 0.12); }
+.j-what {
+  display: block; margin-top: 3px; color: var(--faint);
+  font-size: 0.74rem; font-weight: 400; max-width: 34ch; white-space: normal;
+}
+.j-note { display: block; margin-top: 5px; color: var(--muted); font-size: 0.76rem; max-width: 40ch; }
+.j-dim { color: var(--faint); }
+.j-ref { color: var(--blue); font-size: 0.74rem; text-decoration: none; }
+.j-ref:hover { text-decoration: underline; }
+/* The counts are the point of the whole panel, so they are typeset as data:
+   monospace figures, and a zero is greyed rather than hidden — "0 clubs
+   rated" is the sentence that catches a green run that did nothing. */
+.j-count {
+  display: inline-block; margin: 0 8px 3px 0; font-family: var(--mono);
+  font-size: 0.75rem; color: var(--muted);
+}
+.j-count b { color: var(--ink); font-weight: 700; }
+.j-count.zero, .j-count.zero b { color: var(--faint); }
+.pill.j-pill { display: inline-block; white-space: nowrap; }
+.pill.j-ok { background: rgba(53, 230, 164, 0.14); color: var(--green); }
+.pill.j-wait { background: rgba(125, 211, 252, 0.13); color: var(--blue); }
+.pill.j-stale, .pill.j-noop { background: rgba(251, 191, 36, 0.15); color: var(--amber); }
+.pill.j-fail { background: rgba(251, 113, 133, 0.14); color: var(--red); }
+.pill.j-none { background: rgba(255, 255, 255, 0.06); color: var(--faint); }

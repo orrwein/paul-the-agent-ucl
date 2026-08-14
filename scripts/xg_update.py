@@ -82,8 +82,9 @@ from collections import defaultdict
 from datetime import datetime, timezone
 
 from paths import DB, ROOT
-import tournament as T
 import ingest
+import jobs as J
+import tournament as T
 
 # soccerdata keeps its league config and HTTP cache in one directory. Pointing
 # it inside the repo means the custom-league config travels with the project
@@ -287,8 +288,26 @@ def main():
     con = sqlite3.connect(DB)
     squad = [r[0] for r in con.execute("SELECT name FROM teams")]
     if not squad:
+        # Recorded as a skip and not as the crash it is about to become. The
+        # workflow gate above normally stops us reaching here, but a hand run
+        # before the draw is legitimate, and a job that guards itself
+        # correctly must not appear on the panel as a failure.
+        J.mark("xg", J.SKIPPED,
+               note="no clubs in the database yet — the draw is still to come")
         raise SystemExit("no teams in the DB — run scripts/ingest.py first")
 
+    # The counts below are the ones that would have caught this job's own real
+    # failure: its first dispatched run went green while a pre-draw gate
+    # skipped every step that mattered. clubs_measured is the number the
+    # module docstring's whole coverage argument rests on — roughly 20 of 36
+    # — so a run reporting zero measured clubs while claiming success is
+    # visibly wrong, not merely unremarkable.
+    run_ctx = J.record("xg", enabled=not args.dry_run)
+    with run_ctx as run:
+        _main(args, con, squad, run)
+
+
+def _main(args, con, squad, run):
     print(f"Understat xG for {', '.join(args.seasons)} "
           f"({len(LEAGUES)} leagues, cache in {os.path.relpath(SD_DIR, ROOT)})")
     stats = rolling(collect(load_understat(args.seasons)), args.last)
@@ -324,9 +343,11 @@ def main():
         print(f"{team:30} {src:26} {xgf:5.2f} {xga:5.2f} {n:4}")
 
     print(f"\ncoverage: {len(hit)}/{len(squad)} clubs on measured xG")
+    run.set(clubs_measured=len(hit))
 
     derived = reseed_uncovered(
         con, [(t, f, a) for t, _s, f, a, _n in hit], missed)
+    run.set(clubs_rescaled=len(derived))
     if derived:
         print(f"\n{len(derived)} clubs outside the big five, rescaled from Elo "
               f"onto the observed xG range:")
@@ -351,6 +372,7 @@ def main():
     # would penalise it twice for the same thing.
     print("\nLeague normalisation")
     weights = fit_league_weights(stats, ingest.fetch_clubelo(), aliases)
+    run.set(leagues_weighted=len(weights))
     derived_codes = {lg for (lg,) in con.execute(
         "SELECT DISTINCT league FROM teams WHERE league IS NOT NULL")
         if lg not in weights}
@@ -379,6 +401,12 @@ def main():
     else:
         print("\nDry run — nothing written.")
     con.close()
+
+    # One sentence, and the coverage split is the sentence worth having: it is
+    # the number LAUNCH.md tells the operator to check on the first real run,
+    # and the one that separates an alias miss from a genuine coverage gap.
+    run.note(f"{len(hit)} of {len(squad)} clubs on measured Understat xG, "
+             f"{len(derived)} rescaled from Elo")
 
 
 if __name__ == "__main__":

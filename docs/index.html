@@ -57,7 +57,21 @@
       <div class="hero-state" id="heroState"></div>
       <div class="hero-stats" id="heroStats"></div>
       <p class="updated" id="updated"></p>
+      <!-- Job health. One line, always visible, directly under the "data
+           generated" stamp — because the stamp is exactly where a reader
+           already looks to ask "is this current?", and this answers the
+           harder version of that question. It expands in place, and expands
+           itself when something is wrong, so the predictions below are never
+           pushed down for a panel that has nothing to say. -->
+      <div class="jobs-strip" id="jobsStrip" hidden></div>
     </section>
+
+    <!-- The expanded table lives outside the hero, which is a narrow 900px
+         centred column. Five columns of dense counts need the full 1180px the
+         rest of the page uses; cramming them into the hero made every row wrap
+         three deep. Collapsed by default, so it occupies nothing until asked
+         for — or until something is wrong, when it opens itself. -->
+    <div class="jobs-panel" id="jobsPanel" hidden></div>
 
     <section id="scorecard" class="section" aria-labelledby="scorecardH">
       <div class="section-head">

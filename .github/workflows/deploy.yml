@@ -40,6 +40,13 @@ jobs:
           python-version: "3.12"
 
       - name: Regenerate site data from database
+        # This also writes the `export` heartbeat — into a database on a runner
+        # that is thrown away, since this workflow has read-only contents
+        # permission and commits nothing. That is fine and deliberate:
+        # export_site splices its own still-open heartbeat into the payload it
+        # is writing, so the published page always carries the timestamp of the
+        # run that built it. The row in the database would only be a duplicate
+        # of what the page already says.
         run: python scripts/export_site.py
 
       - name: Upload Pages artifact

@@ -128,7 +128,15 @@ jobs:
 
       - name: Waiting for the league-phase draw
         if: steps.ready.outputs.go != 'true'
-        run: echo "::notice::No teams/fixtures yet (draw is 27 Aug 2026) — skipping the model pipeline. Expected, not a failure."
+        # The heartbeat matters more than the notice. A job that correctly does
+        # nothing and records nothing is indistinguishable from a job that has
+        # stopped firing — both leave the same silence — so the skip is written
+        # down, with its reason, and the site renders it as healthy-and-waiting
+        # rather than counting the days since the nightly was last heard from.
+        run: |
+          echo "::notice::No teams/fixtures yet (draw is 27 Aug 2026) — skipping the model pipeline. Expected, not a failure."
+          python3 scripts/jobs.py record nightly --outcome skipped \
+            --note "no clubs or fixtures in the database yet — the league-phase draw is 27 Aug 2026"
 
       # ---------------------------------------------------------------------
       # Odds: only near kickoff. See the credit budget note at the top.
@@ -170,16 +178,51 @@ jobs:
         run: python3 scripts/ingest.py --odds
 
       - name: Refresh data and rebuild the site
+        id: refresh
         if: steps.ready.outputs.go == 'true'
         # update.py = ingest(results, scorers, elo) -> calibrate -> form ->
         # momentum -> simulate -> export_site. Network on: no --offline here.
+        #
+        # A failure here must NOT stop the steps below. update.py records a
+        # `failed` heartbeat on its way down, and that heartbeat is worth
+        # nothing sitting in a database on a discarded runner: it has to be
+        # exported, committed and deployed, or the one place anybody actually
+        # looks — the site — goes on showing yesterday's green. The run is
+        # still failed for the Actions tab; see "Fail the run" at the end.
+        continue-on-error: true
         run: python3 scripts/update.py
+
+      - name: Rebuild the site payload
+        # Always, including before the draw and after a failed refresh. Two
+        # reasons, both structural. The panel lives in docs/data.json, so a
+        # payload that is not regenerated cannot report anything, least of all
+        # that something is wrong. And export_site.py is the source of the
+        # `export` heartbeat, which the browser ages against its own clock —
+        # so the site build reporting itself daily is what makes a deploy that
+        # quietly stopped visible on the page it stopped updating.
+        #
+        # Safe on an empty database: export_site emits a pre_draw payload and
+        # records its own run as a skip.
+        if: always()
+        continue-on-error: true
+        run: python3 scripts/export_site.py
 
       # ---------------------------------------------------------------------
       # Commit only if something actually moved.
       # ---------------------------------------------------------------------
       - name: Commit refreshed data
         id: commit
+        # `always()` because the heartbeats are the thing most worth keeping
+        # when a run goes badly, and they are written into the database this
+        # step commits.
+        #
+        # Side effect worth having: every nightly now changes the database,
+        # because every nightly writes a heartbeat. LAUNCH.md's end-of-season
+        # note warns that GitHub disables scheduled workflows after 60 days of
+        # *repository* inactivity, and that a nightly committing nothing (as it
+        # does before the draw) does not reset that clock. A daily heartbeat
+        # commit does.
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -196,7 +239,10 @@ jobs:
           fi
 
       - name: Upload Pages artifact
-        if: steps.ready.outputs.go == 'true'
+        # Not gated on the draw any more: before it, the site still has a job
+        # panel to publish, and that panel is the only thing that can report
+        # the nightly is alive while there is no data for it to move.
+        if: always()
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
@@ -212,7 +258,23 @@ jobs:
             echo "- pipeline ran: ${{ steps.ready.outputs.go }}"
             echo "- odds pulled: ${{ steps.odds.outputs.pull || 'false' }} (fixtures within 48h: ${{ steps.odds.outputs.upcoming || 0 }})"
             echo "- committed: ${{ steps.commit.outputs.changed }}"
+            echo ""
+            echo "#### Heartbeats"
+            echo ""
+            echo '```'
+            python3 scripts/jobs.py show || true
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the run if the refresh failed
+        # The refresh step swallowed its own failure so the heartbeat could be
+        # exported and deployed. Reinstate it here, last, so the Actions tab
+        # still goes red — the site panel is an addition to that signal, not a
+        # replacement for it.
+        if: steps.refresh.outcome == 'failure'
+        run: |
+          echo "::error::scripts/update.py failed — see the heartbeat panel on the site."
+          exit 1
 
   # -------------------------------------------------------------------------
   # Deploy from this workflow rather than letting the commit above trigger
@@ -227,7 +289,11 @@ jobs:
   # -------------------------------------------------------------------------
   deploy:
     needs: refresh
-    if: needs.refresh.outputs.go == 'true'
+    # Deploy even when the refresh failed or found nothing to do. The payload
+    # uploaded above carries the job panel, and the whole point of the panel is
+    # that a bad night is visible on the site; refusing to publish exactly when
+    # something is wrong would defeat it.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       pages: write

@@ -26,11 +26,17 @@ elo/team_form  - model inputs, refreshed each matchday
 scoring        - which scoring ruleset is active for each round (the rules
                  themselves live in scripts/scoring.py — see its docstring for
                  why they are versioned in code rather than stored here)
+job_runs       - one row per run of each automated job, recording what it
+                 actually DID rather than whether it exited zero. Created by
+                 scripts/jobs.py, which every entry point calls, so an older
+                 database grows the table on its next run; created here too so
+                 a fresh one has it from the start
 """
 import os
 import sqlite3
 
 from paths import DB
+import jobs as J
 import scoring as S
 import tournament as T
 
@@ -212,6 +218,10 @@ def main():
     # and a no-op on the table just created — but this script is run against
     # existing databases too, and re-running it must never reset one.
     S.ensure_schema(con)
+    # Same one-DDL-two-callers arrangement as BET_HISTORY_DDL above: every job
+    # creates job_runs before writing to it, so this is only about a fresh
+    # database having the table before its first job ever runs.
+    J.ensure_schema(con)
 
     scoring_rows = S.seed_rows()
     for round_id, dir_pts, exact_pts, ruleset in scoring_rows:
